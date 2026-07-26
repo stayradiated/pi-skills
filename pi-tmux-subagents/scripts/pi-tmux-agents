@@ -14,7 +14,6 @@ Usage: pi-tmux-agents COMMAND [ARGS]
 
 Commands:
   doctor
-  init
   start NAME [options] -- TASK
   send NAME MESSAGE...
   status [NAME]
@@ -26,19 +25,10 @@ Commands:
   stop NAME
   stop-all
   clean NAME [--remove-worktree]
-  clean-all
 
 Start options:
-  --worktree              Create an isolated Git worktree and branch
+  --worktree              Create a Git worktree and branch
   --cwd DIR               Run in an existing directory
-  --model MODEL           Pi model pattern or ID
-  --provider PROVIDER     Pi provider
-  --thinking LEVEL        Pi thinking level
-  --tools LIST            Pi tool allowlist
-  --no-context            Disable AGENTS.md / CLAUDE.md discovery
-  --approve-project       Trust project-local Pi resources for this child
-  --inherit-resources     Load discovered extensions and skills
-  --task-file FILE        Read task from FILE
 EOF_USAGE
 }
 
@@ -74,16 +64,12 @@ write_atomic() { local path=$1 value=$2; printf '%s\n' "$value" >"$path.tmp"; mv
 
 ensure_dirs() {
   mkdir -p "$AGENTS_DIR" "$WORKTREES_DIR"
-  cat >"$STATE_DIR/swarm.env" <<EOF_ENV
-ROOT=$ROOT
-SESSION=$SESSION
-STATE_DIR=$STATE_DIR
-EOF_ENV
 }
 
 tmux_alive() {
-  local target=$1
-  tmux display-message -p -t "$target" '#{window_id}' >/dev/null 2>&1
+  local target=$1 actual
+  actual=$(tmux display-message -p -t "$target" '#{window_id}' 2>/dev/null) || return 1
+  [[ -n "$actual" && "$actual" == "$target" ]]
 }
 
 get_target() {
@@ -128,91 +114,36 @@ cmd_doctor() {
   return "$failed"
 }
 
-cmd_init() {
-  ensure_dirs
-  printf 'initialised %s\n' "$STATE_DIR"
-  printf 'tmux session %s (created on first start)\n' "$SESSION"
-}
-
 build_prompt() {
   local name=$1 dir=$2 cwd=$3 task=$4 branch=$5
-  local status_file="$dir/status" result_file="$dir/result.md" failure_file="$dir/failure.md"
-  local q_status q_result q_failure
+  local status_file="$dir/status" result_file="$dir/result.md" q_status q_result
   printf -v q_status '%q' "$status_file"
   printf -v q_result '%q' "$result_file"
-  printf -v q_failure '%q' "$failure_file"
 
-  cat >"$dir/prompt.md" <<EOF_HEAD
-# Managed Pi subagent: $name
+  cat >"$dir/prompt.md" <<EOF_PROMPT
+# Subagent: $name
 
-You are a child Pi coding-agent session managed by a parent Pi through tmux.
-
-## Assignment
+## Task
 
 $task
 
-## Working environment
+## Context
 
 - Working directory: $cwd
-- Branch: ${branch:-shared/no dedicated branch}
-- Agent state directory: $dir
-- Status file: $status_file
-- Result file: $result_file
-- Failure file: $failure_file
-EOF_HEAD
+- Branch: ${branch:-shared working tree}
+- Status: $status_file
+- Result: $result_file
 
-  cat >>"$dir/prompt.md" <<'EOF_BODY'
+Stay within the task and working directory. Do not spawn agents, merge, rebase, or push.
 
-## Mandatory operating contract
+Set status atomically to \`running\` before work. Write a concise result covering outcome, evidence, changes, validation, risks, and handoff; then set status to \`done\`. If blocked or failed, write the reason and set status to \`blocked\` or \`failed\`. Remain available for steering.
 
-1. Work only on this assignment. Normal project work must stay inside the assigned working directory. Writing the manager-provided status, result, and failure files is explicitly allowed.
-2. Do not spawn more agents unless the assignment explicitly tells you to orchestrate.
-3. Keep changes minimal and scoped. Do not merge, rebase, push, or modify the manager's branch.
-4. Treat later user messages in this session as steering from the manager or human.
-5. While actively working, ensure the status file contains exactly `running`.
-6. If blocked, write a useful explanation and the precise decision needed to the result file, then atomically set status to `blocked`. Remain in this Pi session for steering.
-7. On success, completely write the result file using the format below, then atomically set status to `done`. Do not set `done` before the result file is complete.
-8. On failure, write the failure file and any useful partial handoff, then atomically set status to `failed`.
-9. After reporting a terminal status, remain available in the Pi session. Do not run `/quit` unless instructed.
+Status update:
 
-Use shell commands equivalent to the following for atomic status updates; substitute `running`, `blocked`, `done`, or `failed` as appropriate:
-EOF_BODY
+    printf '%s\\n' STATUS > $q_status.tmp && mv $q_status.tmp $q_status
 
-  printf '\n    printf '\''%%s\\n'\'' done > %s.tmp && mv %s.tmp %s\n' "$q_status" "$q_status" "$q_status" >>"$dir/prompt.md"
-
-  cat >>"$dir/prompt.md" <<EOF_PATHS
-
-Write the complete result to $q_result. Write failure details to $q_failure.
-EOF_PATHS
-
-  cat >>"$dir/prompt.md" <<'EOF_RESULT'
-
-## Required result format
-
-```markdown
-# Result
-
-## Outcome
-What you accomplished or concluded.
-
-## Evidence
-Files, line ranges, commands, and important observations.
-
-## Changes
-Files changed and why, or "None".
-
-## Validation
-Tests/checks run and their outcomes; identify anything not validated.
-
-## Risks and open questions
-Remaining uncertainty, edge cases, or conflicts.
-
-## Handoff
-The exact next step the manager should take.
-```
-
-Begin now. First set status to `running`, then perform the assignment.
-EOF_RESULT
+Write the result to $q_result. Begin now.
+EOF_PROMPT
 }
 
 shell_join() {
@@ -226,8 +157,8 @@ shell_join() {
 
 cmd_start() {
   [[ $# -ge 1 ]] || die "start requires NAME"
-  local original_name=$1 name dir task='' task_file='' cwd="$ROOT" use_worktree=0 cwd_set=0
-  local model='' provider='' thinking='' tools='' no_context=0 approve_project=0 inherit_resources=0 branch=''
+  local original_name=$1 name dir task='' cwd="$ROOT" use_worktree=0 cwd_set=0
+  local branch=''
   local created_worktree=0 target=''
   shift
   name=$(safe_name "$original_name")
@@ -238,25 +169,12 @@ cmd_start() {
     case "$1" in
       --worktree) use_worktree=1; shift ;;
       --cwd) [[ $# -ge 2 ]] || die "--cwd requires DIR"; cwd=$2; cwd_set=1; shift 2 ;;
-      --model) [[ $# -ge 2 ]] || die "--model requires MODEL"; model=$2; shift 2 ;;
-      --provider) [[ $# -ge 2 ]] || die "--provider requires PROVIDER"; provider=$2; shift 2 ;;
-      --thinking) [[ $# -ge 2 ]] || die "--thinking requires LEVEL"; thinking=$2; shift 2 ;;
-      --tools) [[ $# -ge 2 ]] || die "--tools requires LIST"; tools=$2; shift 2 ;;
-      --no-context) no_context=1; shift ;;
-      --approve-project) approve_project=1; shift ;;
-      --inherit-resources) inherit_resources=1; shift ;;
-      --task-file) [[ $# -ge 2 ]] || die "--task-file requires FILE"; task_file=$2; shift 2 ;;
       --) shift; task="$*"; break ;;
       *) die "unknown start option: $1" ;;
     esac
   done
 
   [[ $use_worktree -eq 0 || $cwd_set -eq 0 ]] || die "use either --worktree or --cwd, not both"
-  if [[ -n "$task_file" ]]; then
-    [[ -f "$task_file" ]] || die "task file not found: $task_file"
-    [[ -z "$task" ]] || die "provide task via --task-file or after --, not both"
-    task=$(cat "$task_file")
-  fi
   [[ -n "${task//[[:space:]]/}" ]] || die "task is empty"
   if [[ $use_worktree -eq 1 ]]; then
     has git || die "git is required for --worktree"
@@ -289,8 +207,6 @@ cmd_start() {
 
   ensure_dirs
   mkdir -p "$dir/session"
-  printf '%s\n' "$task" >"$dir/task.md"
-  printf '%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" >"$dir/started-at"
   write_atomic "$dir/status" starting
 
   if [[ $use_worktree -eq 1 ]]; then
@@ -303,20 +219,7 @@ cmd_start() {
   build_prompt "$name" "$dir" "$cwd" "$task" "$branch"
 
   local -a pi_args
-  pi_args=(pi --name "subagent:$name" --session-dir "$dir/session")
-  if [[ $approve_project -eq 1 ]]; then
-    pi_args+=(--approve)
-  else
-    pi_args+=(--no-approve)
-  fi
-  if [[ $inherit_resources -eq 0 ]]; then
-    pi_args+=(--no-extensions --no-skills)
-  fi
-  [[ -n "$model" ]] && pi_args+=(--model "$model")
-  [[ -n "$provider" ]] && pi_args+=(--provider "$provider")
-  [[ -n "$thinking" ]] && pi_args+=(--thinking "$thinking")
-  [[ -n "$tools" ]] && pi_args+=(--tools "$tools")
-  [[ $no_context -eq 1 ]] && pi_args+=(--no-context-files)
+  pi_args=(pi --name "subagent:$name" --session-dir "$dir/session" --no-approve --no-extensions --no-skills)
   pi_args+=("@$dir/prompt.md" "Execute the managed assignment in the attached brief.")
 
   local shell_cmd window="agent-$name"
@@ -327,7 +230,6 @@ cmd_start() {
     target=$(tmux new-session -d -P -F '#{window_id}' -s "$SESSION" -n "$window" -c "$cwd" "bash -c $(printf '%q' "$shell_cmd")")
   fi
   printf '%s\n' "$target" >"$dir/tmux-target"
-  write_atomic "$dir/status" running
   trap - ERR
 
   printf 'started %-20s %s\n' "$name" "$target"
@@ -406,8 +308,6 @@ cmd_result() {
   printf 'status: %s\n\n' "$status"
   if [[ -s "$dir/result.md" ]]; then
     cat "$dir/result.md"
-  elif [[ -s "$dir/failure.md" ]]; then
-    cat "$dir/failure.md"
   else
     printf '(no result yet)\n'
   fi
@@ -426,7 +326,7 @@ cmd_info() {
     case "$field" in
       name) basename "$dir" ;;
       status) status_value "$dir"; printf '\n' ;;
-      cwd|branch|tmux-target|started-at) read_file "$dir/$field"; printf '\n' ;;
+      cwd|branch|tmux-target) read_file "$dir/$field"; printf '\n' ;;
       state-dir) printf '%s\n' "$dir" ;;
       *) die "unknown field: $field" ;;
     esac
@@ -437,7 +337,6 @@ cmd_info() {
   printf 'cwd:        %s\n' "$(read_file "$dir/cwd")"
   printf 'branch:     %s\n' "$(read_file "$dir/branch")"
   printf 'tmux:       %s\n' "$(read_file "$dir/tmux-target")"
-  printf 'started-at: %s\n' "$(read_file "$dir/started-at")"
   printf 'state-dir:  %s\n' "$dir"
 }
 
@@ -556,31 +455,15 @@ cmd_clean() {
   fi
 }
 
-cmd_clean_all() {
-  ensure_dirs
-  local dir status
-  shopt -s nullglob
-  for dir in "$AGENTS_DIR"/*; do
-    status=$(status_value "$dir")
-    case "$status" in
-      running|starting) err "skipping active agent $(basename "$dir")" ;;
-      *) rm -rf "$dir" ;;
-    esac
-  done
-  shopt -u nullglob
-  printf 'cleaned non-active agent state; worktrees retained\n'
-}
-
 main() {
   local cmd=${1:-}
   [[ -n "$cmd" ]] || { usage; exit 64; }
   shift || true
   case "$cmd" in
     doctor) cmd_doctor "$@" ;;
-    init) cmd_init "$@" ;;
     start) cmd_start "$@" ;;
     send) cmd_send "$@" ;;
-    status|list) cmd_status "$@" ;;
+    status) cmd_status "$@" ;;
     capture) cmd_capture "$@" ;;
     result) cmd_result "$@" ;;
     info) cmd_info "$@" ;;
@@ -589,7 +472,6 @@ main() {
     stop) cmd_stop "$@" ;;
     stop-all) cmd_stop_all "$@" ;;
     clean) cmd_clean "$@" ;;
-    clean-all) cmd_clean_all "$@" ;;
     -h|--help|help) usage ;;
     *) usage >&2; die "unknown command: $cmd" ;;
   esac

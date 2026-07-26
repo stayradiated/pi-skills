@@ -46,8 +46,7 @@ expect_status() {
 }
 
 bash -n "$CLI" "$SKILL_DIR/scripts/run-agent.sh"
-run init >/dev/null
-[[ -d "$STATE/agents" ]]
+mkdir -p "$STATE/agents"
 
 # Names must never resolve to the agents directory or its parent.
 expect_status 1 status .
@@ -82,6 +81,7 @@ done
 [[ -s "$ARGS_FILE" ]]
 target=$(run info smoke --field tmux-target)
 [[ "$target" == @* ]]
+[[ "$(run info smoke --field status)" == starting ]]
 grep -Fx -- '--no-approve' "$ARGS_FILE" >/dev/null
 grep -Fx -- '--no-extensions' "$ARGS_FILE" >/dev/null
 grep -Fx -- '--no-skills' "$ARGS_FILE" >/dev/null

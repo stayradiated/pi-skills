@@ -9,7 +9,7 @@ fi
 agent_dir=$1
 shift
 status_file="$agent_dir/status"
-failure_file="$agent_dir/failure.md"
+result_file="$agent_dir/result.md"
 
 set +e
 "$@"
@@ -21,11 +21,13 @@ status=""
 case "$status" in
   done|failed|blocked|stopped) ;;
   *)
-    cat >"$failure_file" <<EOF_FAILURE
-# Failure
+    if [[ ! -s "$result_file" ]]; then
+      cat >"$result_file" <<EOF_FAILURE
+# Result
 
-The Pi child process exited with status $rc before recording a terminal status.
+Pi exited with status $rc before recording a terminal status.
 EOF_FAILURE
+    fi
     printf '%s\n' failed >"$status_file.tmp"
     mv "$status_file.tmp" "$status_file"
     ;;
