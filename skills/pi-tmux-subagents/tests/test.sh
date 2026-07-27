@@ -82,6 +82,7 @@ done
 target=$(run info smoke --field tmux-target)
 [[ "$target" == @* ]]
 [[ "$(run info smoke --field status)" == starting ]]
+grep -Fx -- '--print' "$ARGS_FILE" >/dev/null
 grep -Fx -- '--no-approve' "$ARGS_FILE" >/dev/null
 grep -Fx -- '--no-extensions' "$ARGS_FILE" >/dev/null
 grep -Fx -- '--no-skills' "$ARGS_FILE" >/dev/null

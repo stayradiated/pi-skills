@@ -219,7 +219,9 @@ cmd_start() {
   build_prompt "$name" "$dir" "$cwd" "$task" "$branch"
 
   local -a pi_args
-  pi_args=(pi --name "subagent:$name" --session-dir "$dir/session" --no-approve --no-extensions --no-skills)
+  # Force non-interactive execution: positional prompts otherwise open pi's TUI
+  # when the child inherits tmux's terminal.
+  pi_args=(pi --print --name "subagent:$name" --session-dir "$dir/session" --no-approve --no-extensions --no-skills)
   pi_args+=("@$dir/prompt.md" "Execute the managed assignment in the attached brief.")
 
   local shell_cmd window="agent-$name"
