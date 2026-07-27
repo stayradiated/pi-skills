@@ -204,6 +204,8 @@ cmd_start() {
   write_atomic "$dir/status" starting
 
   printf '%s\n' "$cwd" >"$dir/cwd"
+  printf '%s\n' "$ZELLIJ_PANE_ID" >"$dir/parent-zellij-pane"
+  printf '%s\n' "$SCRIPT_DIR/pi-zellij-agents" >"$dir/manager-cli"
   build_prompt "$name" "$dir" "$cwd" "$task"
 
   local -a pi_args
@@ -315,7 +317,7 @@ cmd_info() {
     case "$field" in
       name) basename "$dir" ;;
       status) status_value "$dir"; printf '\n' ;;
-      cwd|zellij-tab|zellij-pane) read_file "$dir/$field"; printf '\n' ;;
+      cwd|zellij-tab|zellij-pane|parent-zellij-pane) read_file "$dir/$field"; printf '\n' ;;
       state-dir) printf '%s\n' "$dir" ;;
       *) die "unknown field: $field" ;;
     esac
@@ -326,6 +328,7 @@ cmd_info() {
   printf 'cwd:        %s\n' "$(read_file "$dir/cwd")"
   printf 'tab:        %s\n' "$(read_file "$dir/zellij-tab")"
   printf 'pane:       %s\n' "$(read_file "$dir/zellij-pane")"
+  printf 'parent-pane: %s\n' "$(read_file "$dir/parent-zellij-pane")"
   printf 'state-dir:  %s\n' "$dir"
 }
 

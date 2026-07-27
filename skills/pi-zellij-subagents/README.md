@@ -1,6 +1,6 @@
 # pi-zellij-subagents
 
-A Pi skill for spawning observable child Pi sessions as tabs in the current Zellij session.
+A Pi skill for spawning observable child Pi sessions as tabs in the current Zellij session. Children notify the manager pane when they finish, block, or fail; durable state files remain the source of truth.
 
 ## Development install
 

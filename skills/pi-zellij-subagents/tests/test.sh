@@ -3,12 +3,15 @@ set -euo pipefail
 
 SKILL_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 CLI="$SKILL_DIR/scripts/pi-zellij-agents"
+RUNNER="$SKILL_DIR/scripts/run-agent.sh"
 TMP=$(mktemp -d)
 STATE="$TMP/state"
 ARGS_FILE="$TMP/pi-args"
 
+sink_pane=''
 cleanup() {
   local root dir tab
+  [[ -z "$sink_pane" ]] || zellij action close-pane --pane-id "$sink_pane" >/dev/null 2>&1 || true
   for root in "$STATE" "$TMP/project/relative-state"; do
     [[ -d "$root/agents" ]] || continue
     for dir in "$root/agents"/*; do
@@ -21,8 +24,37 @@ cleanup() {
 }
 trap cleanup EXIT
 
-# Syntax checks must run even when Zellij integration is unavailable.
-bash -n "$CLI" "$SKILL_DIR/scripts/run-agent.sh"
+# Syntax and notification tests must run even when Zellij integration is unavailable.
+bash -n "$CLI" "$RUNNER"
+
+# A terminal child status sends exactly one fixed completion message to its parent pane.
+NOTIFY_AGENT="$TMP/notify-agent"
+NOTIFY_BIN="$TMP/notify-bin"
+NOTIFY_LOG="$TMP/notify.log"
+mkdir -p "$NOTIFY_AGENT" "$NOTIFY_BIN"
+printf '%s\n' starting >"$NOTIFY_AGENT/status"
+printf '%s\n' parent-pane-42 >"$NOTIFY_AGENT/parent-zellij-pane"
+printf '%s\n' "$CLI" >"$NOTIFY_AGENT/manager-cli"
+cat >"$NOTIFY_BIN/zellij" <<'EOF_ZELLIJ'
+#!/usr/bin/env bash
+printf '%q ' "$@" >>"$NOTIFY_LOG"
+printf '\n' >>"$NOTIFY_LOG"
+EOF_ZELLIJ
+cat >"$NOTIFY_BIN/finish-child" <<'EOF_CHILD'
+#!/usr/bin/env bash
+printf '%s\n' done >"$1.tmp"
+mv "$1.tmp" "$1"
+EOF_CHILD
+chmod +x "$NOTIFY_BIN/zellij" "$NOTIFY_BIN/finish-child"
+env PATH="$NOTIFY_BIN:$PATH" NOTIFY_LOG="$NOTIFY_LOG" \
+  "$RUNNER" "$NOTIFY_AGENT" finish-child "$NOTIFY_AGENT/status"
+[[ "$(cat "$NOTIFY_AGENT/notified")" == done ]]
+[[ ! -e "$NOTIFY_AGENT/notification-error" ]]
+[[ "$(grep -c '^action paste ' "$NOTIFY_LOG")" -eq 1 ]]
+[[ "$(grep -c '^action send-keys ' "$NOTIFY_LOG")" -eq 1 ]]
+grep -F -- "--pane-id parent-pane-42" "$NOTIFY_LOG" >/dev/null
+grep -F -- "Agent\\ \'notify-agent\'\\ reached\\ status\\ \'done\'" "$NOTIFY_LOG" >/dev/null
+grep -F -- "result\\ notify-agent" "$NOTIFY_LOG" >/dev/null
 
 [[ -n "${ZELLIJ_SESSION_NAME:-}" && -n "${ZELLIJ_PANE_ID:-}" ]] || {
   printf 'skip: pi-zellij-subagents integration test requires Zellij\n'
@@ -55,6 +87,28 @@ expect_status() {
 }
 
 run doctor >/dev/null
+
+# Exercise actual Zellij delivery against a disposable sink pane, never the Pi pane running tests.
+REAL_NOTIFY_AGENT="$TMP/real-notify-agent"
+REAL_NOTIFY_RECEIVED="$TMP/real-notify-received"
+mkdir -p "$REAL_NOTIFY_AGENT"
+printf '%s\n' starting >"$REAL_NOTIFY_AGENT/status"
+printf '%s\n' "$CLI" >"$REAL_NOTIFY_AGENT/manager-cli"
+sink_pane=$(zellij action new-pane --name notification-sink -- bash -c \
+  'IFS= read -r line; printf "%s\n" "$line" >"$1"; sleep 30' _ "$REAL_NOTIFY_RECEIVED")
+zellij action focus-pane-id "$ZELLIJ_PANE_ID"
+printf '%s\n' "$sink_pane" >"$REAL_NOTIFY_AGENT/parent-zellij-pane"
+"$RUNNER" "$REAL_NOTIFY_AGENT" "$NOTIFY_BIN/finish-child" "$REAL_NOTIFY_AGENT/status"
+for _ in {1..50}; do
+  [[ -s "$REAL_NOTIFY_RECEIVED" ]] && break
+  sleep 0.1
+done
+[[ "$(cat "$REAL_NOTIFY_AGENT/notified")" == done ]]
+grep -F -- "[pi-zellij-subagents] Agent 'real-notify-agent' reached status 'done'." \
+  "$REAL_NOTIFY_RECEIVED" >/dev/null
+zellij action close-pane --pane-id "$sink_pane" >/dev/null
+sink_pane=''
+
 mkdir -p "$STATE/agents"
 
 # Missing Pi fails before creating partial agent state.
