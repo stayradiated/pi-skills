@@ -10,7 +10,7 @@ has() { command -v "$1" >/dev/null 2>&1; }
 
 usage() {
   cat <<'EOF_USAGE'
-Usage: pi-tmux-agents COMMAND [ARGS]
+Usage: pi-zellij-agents COMMAND [ARGS]
 
 Commands:
   doctor
@@ -24,25 +24,17 @@ Commands:
   wait-all [TIMEOUT_SECONDS]
   stop NAME
   stop-all
-  clean NAME [--remove-worktree]
+  clean NAME
 
 Start options:
-  --worktree              Create a Git worktree and branch
-  --cwd DIR               Run in an existing directory
+  --cwd DIR               Run in an existing directory (default: current directory)
 EOF_USAGE
 }
 
-project_root() {
-  git rev-parse --show-toplevel 2>/dev/null || pwd -P
-}
-
-ROOT=$(project_root)
-ROOT=$(cd "$ROOT" && pwd -P)
-ROOT_HASH=$(printf '%s' "$ROOT" | cksum | awk '{print $1}')
-STATE_DIR=${PI_TMUX_STATE_DIR:-"$ROOT/.pi/tmux-subagents"}
-SESSION=${PI_TMUX_SESSION:-"pi-agents-$ROOT_HASH"}
+ROOT=$(pwd -P)
+STATE_DIR=${PI_ZELLIJ_STATE_DIR:-"$ROOT/.pi/zellij-subagents"}
+[[ "$STATE_DIR" == /* ]] || STATE_DIR="$ROOT/$STATE_DIR"
 AGENTS_DIR="$STATE_DIR/agents"
-WORKTREES_DIR=${PI_TMUX_WORKTREES_DIR:-"$HOME/.pi/agent/tmux-worktrees/$ROOT_HASH"}
 
 safe_name() {
   local raw=$1 safe
@@ -63,29 +55,46 @@ read_file() { [[ -f "$1" ]] && cat "$1" || true; }
 write_atomic() { local path=$1 value=$2; printf '%s\n' "$value" >"$path.tmp"; mv "$path.tmp" "$path"; }
 
 ensure_dirs() {
-  mkdir -p "$AGENTS_DIR" "$WORKTREES_DIR"
+  mkdir -p "$AGENTS_DIR"
 }
 
-tmux_alive() {
-  local target=$1 actual
-  actual=$(tmux display-message -p -t "$target" '#{window_id}' 2>/dev/null) || return 1
-  [[ -n "$actual" && "$actual" == "$target" ]]
+require_zellij_session() {
+  [[ -n "${ZELLIJ_SESSION_NAME:-}" && -n "${ZELLIJ_PANE_ID:-}" ]] ||
+    die "pi-zellij-subagents must run inside an attached Zellij session"
 }
 
-get_target() {
+tab_alive() {
+  local target=$1
+  zellij action list-tabs 2>/dev/null | awk -v id="$target" 'NR > 1 && $1 == id { found=1 } END { exit !found }'
+}
+
+get_tab() {
   local dir=$1 target
-  target=$(read_file "$dir/tmux-target")
-  [[ -n "$target" ]] || die "missing tmux target for $(basename "$dir")"
+  target=$(read_file "$dir/zellij-tab")
+  [[ -n "$target" ]] || die "missing Zellij tab ID for $(basename "$dir")"
   printf '%s' "$target"
+}
+
+get_pane() {
+  local dir=$1 pane attempts=${2:-25}
+  for ((attempts; attempts > 0; attempts--)); do
+    pane=$(read_file "$dir/zellij-pane")
+    [[ -n "$pane" ]] && { printf '%s' "$pane"; return 0; }
+    sleep 0.1
+  done
+  die "missing Zellij pane ID for $(basename "$dir")"
 }
 
 status_value() {
   local dir=$1 status target
   status=$(read_file "$dir/status")
-  [[ -n "$status" ]] || status=unknown
+  case "$status" in
+    starting|running|blocked|done|failed|stopped) ;;
+    *) status=unknown ;;
+  esac
   if [[ "$status" == starting || "$status" == running ]]; then
-    target=$(read_file "$dir/tmux-target")
-    if [[ -n "$target" ]] && ! tmux_alive "$target"; then
+    target=$(read_file "$dir/zellij-tab")
+    if [[ -n "$target" ]] && ! tab_alive "$target"; then
       status=exited
     fi
   fi
@@ -94,7 +103,7 @@ status_value() {
 
 cmd_doctor() {
   local failed=0
-  for c in bash tmux pi; do
+  for c in bash zellij pi; do
     if has "$c"; then
       printf 'ok   %-8s %s\n' "$c" "$(command -v "$c")"
     else
@@ -102,20 +111,18 @@ cmd_doctor() {
       failed=1
     fi
   done
-  if has git && git -C "$ROOT" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
-    printf 'ok   %-8s %s\n' git "$(git -C "$ROOT" rev-parse --show-toplevel)"
-  elif has git; then
-    printf 'warn %-8s current directory is not a Git worktree; --worktree unavailable\n' git
+  if [[ -n "${ZELLIJ_SESSION_NAME:-}" && -n "${ZELLIJ_PANE_ID:-}" ]]; then
+    printf 'ok   %-8s %s (pane %s)\n' session "$ZELLIJ_SESSION_NAME" "$ZELLIJ_PANE_ID"
   else
-    printf 'warn %-8s not found; --worktree unavailable\n' git
+    printf 'MISS %-8s not running inside an attached Zellij session\n' session
+    failed=1
   fi
-  printf 'info session  %s\n' "$SESSION"
   printf 'info state    %s\n' "$STATE_DIR"
   return "$failed"
 }
 
 build_prompt() {
-  local name=$1 dir=$2 cwd=$3 task=$4 branch=$5
+  local name=$1 dir=$2 cwd=$3 task=$4
   local status_file="$dir/status" result_file="$dir/result.md" q_status q_result
   printf -v q_status '%q' "$status_file"
   printf -v q_result '%q' "$result_file"
@@ -130,7 +137,6 @@ $task
 ## Context
 
 - Working directory: $cwd
-- Branch: ${branch:-shared working tree}
 - Status: $status_file
 - Result: $result_file
 
@@ -157,9 +163,10 @@ shell_join() {
 
 cmd_start() {
   [[ $# -ge 1 ]] || die "start requires NAME"
-  local original_name=$1 name dir task='' cwd="$ROOT" use_worktree=0 cwd_set=0
-  local branch=''
-  local created_worktree=0 target=''
+  local original_name=$1 name dir task='' cwd="$ROOT"
+  local target='' original_tab='' pi_bin
+  require_zellij_session
+  pi_bin=$(command -v pi) || die "pi not found"
   shift
   name=$(safe_name "$original_name")
   dir=$(agent_dir "$name")
@@ -167,35 +174,22 @@ cmd_start() {
 
   while [[ $# -gt 0 ]]; do
     case "$1" in
-      --worktree) use_worktree=1; shift ;;
-      --cwd) [[ $# -ge 2 ]] || die "--cwd requires DIR"; cwd=$2; cwd_set=1; shift 2 ;;
+      --cwd) [[ $# -ge 2 ]] || die "--cwd requires DIR"; cwd=$2; shift 2 ;;
       --) shift; task="$*"; break ;;
       *) die "unknown start option: $1" ;;
     esac
   done
 
-  [[ $use_worktree -eq 0 || $cwd_set -eq 0 ]] || die "use either --worktree or --cwd, not both"
   [[ -n "${task//[[:space:]]/}" ]] || die "task is empty"
-  if [[ $use_worktree -eq 1 ]]; then
-    has git || die "git is required for --worktree"
-    git -C "$ROOT" rev-parse --is-inside-work-tree >/dev/null 2>&1 || die "--worktree requires a Git repository"
-    cwd="$WORKTREES_DIR/$name"
-    [[ ! -e "$cwd" ]] || die "worktree path already exists: $cwd"
-    branch="pi-agent/$name-$(date -u +%Y%m%d%H%M%S)"
-  else
-    [[ -d "$cwd" ]] || die "working directory not found: $cwd"
-    cwd=$(cd "$cwd" && pwd -P)
-  fi
+  [[ -d "$cwd" ]] || die "working directory not found: $cwd"
+  cwd=$(cd "$cwd" && pwd -P)
 
   start_rollback() {
     local rc=$?
+    [[ $# -eq 0 ]] || rc=$1
     trap - ERR
-    if [[ -n "$target" ]] && tmux_alive "$target"; then
-      tmux kill-window -t "$target" 2>/dev/null || true
-    fi
-    if [[ $created_worktree -eq 1 ]]; then
-      git -C "$ROOT" worktree remove --force "$cwd" >/dev/null 2>&1 || true
-      git -C "$ROOT" branch -D "$branch" >/dev/null 2>&1 || true
+    if [[ -n "$target" ]] && tab_alive "$target"; then
+      zellij action close-tab-by-id "$target" 2>/dev/null || true
     fi
     if [[ -n "$dir" ]]; then
       assert_agent_dir "$dir"
@@ -209,36 +203,30 @@ cmd_start() {
   mkdir -p "$dir/session"
   write_atomic "$dir/status" starting
 
-  if [[ $use_worktree -eq 1 ]]; then
-    git -C "$ROOT" worktree add -b "$branch" "$cwd" HEAD >/dev/null
-    created_worktree=1
-  fi
-
   printf '%s\n' "$cwd" >"$dir/cwd"
-  printf '%s\n' "$branch" >"$dir/branch"
-  build_prompt "$name" "$dir" "$cwd" "$task" "$branch"
+  build_prompt "$name" "$dir" "$cwd" "$task"
 
   local -a pi_args
-  # Force non-interactive execution: positional prompts otherwise open pi's TUI
-  # when the child inherits tmux's terminal.
-  pi_args=(pi --print --name "subagent:$name" --session-dir "$dir/session" --no-approve --no-extensions --no-skills)
+  pi_args=("$pi_bin" --name "subagent:$name" --session-dir "$dir/session" --no-approve --no-extensions --no-skills)
   pi_args+=("@$dir/prompt.md" "Execute the managed assignment in the attached brief.")
 
-  local shell_cmd window="agent-$name"
+  local shell_cmd tab_name="agent-$name"
   shell_cmd=$(shell_join "$RUNNER" "$dir" "${pi_args[@]}")
-  if tmux has-session -t "$SESSION" 2>/dev/null; then
-    target=$(tmux new-window -d -P -F '#{window_id}' -t "$SESSION:" -n "$window" -c "$cwd" "bash -c $(printf '%q' "$shell_cmd")")
-  else
-    target=$(tmux new-session -d -P -F '#{window_id}' -s "$SESSION" -n "$window" -c "$cwd" "bash -c $(printf '%q' "$shell_cmd")")
+  original_tab=$(zellij action current-tab-info | awk '$1 == "id:" { print $2; exit }')
+  target=$(zellij action new-tab --cwd "$cwd" --name "$tab_name" -- bash -c "$shell_cmd")
+  if [[ ! "$target" =~ ^[0-9]+$ ]]; then
+    err "Zellij did not return a tab ID: $target"
+    start_rollback 1 || true
+    return 1
   fi
-  printf '%s\n' "$target" >"$dir/tmux-target"
+  printf '%s\n' "$target" >"$dir/zellij-tab"
+  if [[ "$original_tab" =~ ^[0-9]+$ ]]; then
+    zellij action go-to-tab-by-id "$original_tab" >/dev/null
+  fi
   trap - ERR
 
-  printf 'started %-20s %s\n' "$name" "$target"
+  printf 'started %-20s tab %s\n' "$name" "$target"
   printf 'cwd     %s\n' "$cwd"
-  if [[ -n "$branch" ]]; then
-    printf 'branch  %s\n' "$branch"
-  fi
 }
 
 require_agent() {
@@ -251,37 +239,35 @@ require_agent() {
 
 cmd_send() {
   [[ $# -ge 2 ]] || die "send requires NAME and MESSAGE"
-  local name=$1 dir target message buffer
+  local name=$1 dir tab pane message
   shift
   message="$*"
   dir=$(require_agent "$name")
-  target=$(get_target "$dir")
-  tmux_alive "$target" || die "tmux target is not alive: $target"
-  buffer="pi-agent-$(safe_name "$name")-$RANDOM"
-  printf '%s' "$message" | tmux load-buffer -b "$buffer" -
-  tmux paste-buffer -b "$buffer" -d -t "$target"
-  tmux send-keys -t "$target" Enter
+  tab=$(get_tab "$dir")
+  tab_alive "$tab" || die "Zellij tab is not alive: $tab"
+  pane=$(get_pane "$dir")
+  zellij action paste --pane-id "$pane" -- "$message"
+  zellij action send-keys --pane-id "$pane" Enter
   printf 'sent to %s\n' "$(safe_name "$name")"
 }
 
 print_status_one() {
-  local name=$1 dir status cwd target branch
+  local name=$1 dir status cwd target
   dir=$(require_agent "$name")
   status=$(status_value "$dir")
   cwd=$(read_file "$dir/cwd")
-  target=$(read_file "$dir/tmux-target")
-  branch=$(read_file "$dir/branch")
-  printf '%-22s %-9s %-28s %s\n' "$(safe_name "$name")" "$status" "${target:--}" "${branch:-$cwd}"
+  target=$(read_file "$dir/zellij-tab")
+  printf '%-22s %-9s %-12s %s\n' "$(safe_name "$name")" "$status" "${target:--}" "$cwd"
 }
 
 cmd_status() {
   if [[ $# -gt 0 ]]; then
-    printf '%-22s %-9s %-28s %s\n' NAME STATUS TMUX BRANCH_OR_CWD
+    printf '%-22s %-9s %-12s %s\n' NAME STATUS TAB CWD
     print_status_one "$1"
     return
   fi
   ensure_dirs
-  printf '%-22s %-9s %-28s %s\n' NAME STATUS TMUX BRANCH_OR_CWD
+  printf '%-22s %-9s %-12s %s\n' NAME STATUS TAB CWD
   local found=0 dir
   shopt -s nullglob
   for dir in "$AGENTS_DIR"/*; do
@@ -294,12 +280,13 @@ cmd_status() {
 
 cmd_capture() {
   [[ $# -ge 1 ]] || die "capture requires NAME"
-  local dir target lines=${2:-80}
+  local dir tab pane lines=${2:-80}
   [[ "$lines" =~ ^[0-9]+$ ]] || die "LINES must be a non-negative integer"
   dir=$(require_agent "$1")
-  target=$(get_target "$dir")
-  tmux_alive "$target" || die "tmux target is not alive: $target"
-  tmux capture-pane -p -J -S "-$lines" -t "$target"
+  tab=$(get_tab "$dir")
+  tab_alive "$tab" || die "Zellij tab is not alive: $tab"
+  pane=$(get_pane "$dir")
+  zellij action dump-screen --full --pane-id "$pane" | tail -n "$lines"
 }
 
 cmd_result() {
@@ -328,7 +315,7 @@ cmd_info() {
     case "$field" in
       name) basename "$dir" ;;
       status) status_value "$dir"; printf '\n' ;;
-      cwd|branch|tmux-target) read_file "$dir/$field"; printf '\n' ;;
+      cwd|zellij-tab|zellij-pane) read_file "$dir/$field"; printf '\n' ;;
       state-dir) printf '%s\n' "$dir" ;;
       *) die "unknown field: $field" ;;
     esac
@@ -337,8 +324,8 @@ cmd_info() {
   printf 'name:       %s\n' "$(basename "$dir")"
   printf 'status:     %s\n' "$(status_value "$dir")"
   printf 'cwd:        %s\n' "$(read_file "$dir/cwd")"
-  printf 'branch:     %s\n' "$(read_file "$dir/branch")"
-  printf 'tmux:       %s\n' "$(read_file "$dir/tmux-target")"
+  printf 'tab:        %s\n' "$(read_file "$dir/zellij-tab")"
+  printf 'pane:       %s\n' "$(read_file "$dir/zellij-pane")"
   printf 'state-dir:  %s\n' "$dir"
 }
 
@@ -408,9 +395,9 @@ cmd_stop() {
   [[ $# -ge 1 ]] || die "stop requires NAME"
   local dir target status
   dir=$(require_agent "$1")
-  target=$(read_file "$dir/tmux-target")
-  if [[ -n "$target" ]] && tmux_alive "$target"; then
-    tmux kill-window -t "$target"
+  target=$(read_file "$dir/zellij-tab")
+  if [[ -n "$target" ]] && tab_alive "$target"; then
+    zellij action close-tab-by-id "$target"
   fi
   status=$(status_value "$dir")
   case "$status" in done|failed|blocked) ;; *) write_atomic "$dir/status" stopped ;; esac
@@ -426,35 +413,19 @@ cmd_stop_all() {
     cmd_stop "$name"
   done
   shopt -u nullglob
-  if tmux has-session -t "$SESSION" 2>/dev/null; then
-    tmux kill-session -t "$SESSION" 2>/dev/null || true
-  fi
 }
 
 cmd_clean() {
-  [[ $# -ge 1 ]] || die "clean requires NAME"
-  local name=$1 remove_worktree=0 dir target cwd branch
-  shift
-  if [[ $# -gt 0 ]]; then
-    [[ "$1" == --remove-worktree ]] || die "unknown clean option: $1"
-    remove_worktree=1
-  fi
+  [[ $# -eq 1 ]] || die "clean requires NAME"
+  local name=$1 dir target
   dir=$(require_agent "$name")
   assert_agent_dir "$dir"
-  target=$(read_file "$dir/tmux-target")
-  if [[ -n "$target" ]] && tmux_alive "$target"; then
+  target=$(read_file "$dir/zellij-tab")
+  if [[ -n "$target" ]] && tab_alive "$target"; then
     die "agent is still running; stop it first"
-  fi
-  cwd=$(read_file "$dir/cwd")
-  branch=$(read_file "$dir/branch")
-  if [[ $remove_worktree -eq 1 && -n "$branch" && -n "$cwd" ]]; then
-    git -C "$ROOT" worktree remove "$cwd"
   fi
   rm -rf "$dir"
   printf 'cleaned %s\n' "$(safe_name "$name")"
-  if [[ $remove_worktree -eq 1 && -n "$branch" ]]; then
-    printf 'retained branch %s (delete manually when appropriate)\n' "$branch"
-  fi
 }
 
 main() {

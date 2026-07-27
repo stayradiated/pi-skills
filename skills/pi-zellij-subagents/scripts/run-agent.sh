@@ -10,6 +10,12 @@ agent_dir=$1
 shift
 status_file="$agent_dir/status"
 result_file="$agent_dir/result.md"
+pane_file="$agent_dir/zellij-pane"
+
+if [[ -n "${ZELLIJ_PANE_ID:-}" ]]; then
+  printf '%s\n' "$ZELLIJ_PANE_ID" >"$pane_file.tmp"
+  mv "$pane_file.tmp" "$pane_file"
+fi
 
 set +e
 "$@"
