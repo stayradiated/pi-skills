@@ -1,0 +1,34 @@
+{
+  "name": "@stayradiated/pi-skills",
+  "version": "0.1.0",
+  "description": "A collection of skills for the Pi coding agent",
+  "license": "MIT",
+  "keywords": [
+    "pi-package",
+    "agent-skills",
+    "pi-coding-agent"
+  ],
+  "homepage": "https://github.com/stayradiated/pi-skills#readme",
+  "bugs": {
+    "url": "https://github.com/stayradiated/pi-skills/issues"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/stayradiated/pi-skills.git"
+  },
+  "files": [
+    "skills",
+    "README.md"
+  ],
+  "scripts": {
+    "test": "bash skills/pi-tmux-subagents/tests/test.sh"
+  },
+  "pi": {
+    "skills": [
+      "./skills"
+    ]
+  },
+  "publishConfig": {
+    "access": "public"
+  }
+}
