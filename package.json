@@ -21,7 +21,7 @@
     "README.md"
   ],
   "scripts": {
-    "test": "bash skills/pi-zellij-subagents/tests/test.sh"
+    "test": "bash skills/pi-zellij-subagents/tests/test.sh && bash skills/pi-tmux-subagents/tests/test.sh"
   },
   "pi": {
     "skills": [

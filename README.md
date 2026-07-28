@@ -7,6 +7,8 @@ A small collection of skills for the [Pi coding agent](https://pi.dev).
 - **hone** — stress-test a plan, decision, or idea through a focused interview.
 - **pair-review** — walk through local code changes as an interactive, read-only review.
 - **pi-zellij-subagents** — spawn observable Pi subagents as tabs in the current Zellij session.
+- **pi-tmux-subagents** — delegate observable Pi subagents in tmux, without requiring Zellij.
+- **mise-install** — install and verify user-scoped command-line software with mise.
 
 ## Install
 
@@ -35,7 +37,7 @@ npm test
 
 Use `npm pack --dry-run` to inspect the files included in the npm package.
 
-The `pi-zellij-subagents` skill requires Pi to already be running inside Zellij, plus Bash and the Zellij CLI.
+The `pi-zellij-subagents` skill requires Pi to already be running inside Zellij, plus Bash and the Zellij CLI. The `pi-tmux-subagents` skill requires Bash, tmux, and a `pi` CLI. The `mise-install` skill requires mise.
 
 ## License
 
