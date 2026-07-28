@@ -17,7 +17,12 @@ Use a worktree for children that can edit or run shell commands:
 "$AGENTS" start NAME --worktree -- "TASK"
 ```
 
-For a specific existing directory, use `--cwd DIR` instead.
+For a specific existing directory, use `--cwd DIR` instead. Pin a child model when roles require it:
+
+```bash
+"$AGENTS" start planner --worktree --model openai-codex/gpt-5.6-sol -- "TASK"
+"$AGENTS" start implementer --worktree --model openai-codex/gpt-5.6-terra -- "TASK"
+```
 
 Monitor and collect the durable handoff. Continue manager-owned work first; only wait when a result is the current dependency:
 
