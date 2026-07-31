@@ -6,112 +6,98 @@ compatibility: Requires Pi inside an attached Zellij session, with Bash and the 
 
 # Pi Zellij subagents
 
-Use subagents for independent, bounded work when delegation costs less than doing the work directly.
+Delegate independent, bounded work when delegation is cheaper than doing it directly.
 
-Resolve `scripts/pi-zellij-agents` relative to this file as the absolute path `AGENTS`. Use the current Zellij session. Each child runs in a visible `agent-NAME` tab, and `start` returns the manager to its original tab.
+Resolve `scripts/pi-zellij-agents` relative to this file as the absolute path `AGENTS`. Each child runs in a visible `agent-NAME` tab in the current Zellij session.
 
-## Rules
+## Guardrails
 
-- Keep delegation one level deep; children must not spawn agents.
-- Run at most four children concurrently.
-- Give each child one bounded outcome with explicit validation.
-- Assign distinct write scopes. Neither the manager nor another child may edit files assigned to an active child.
-- Continue manager-owned work after delegation; do not wait or poll while useful independent work remains.
-- Treat every result as an unverified handoff. The manager owns integration, final validation, and cleanup.
+- Run at most four direct children concurrently. Children may delegate, but must close their own children before returning.
+- Give each child one outcome, an exclusive write scope, and explicit validation.
+- Always pass `--model` and `--thinking`; never rely on inherited defaults.
+- Use a fresh child for each task. Do not repurpose completed children.
+- Do not edit files owned by an active child.
+- Continue manager work instead of polling or waiting.
+- Treat every handoff as unverified. The manager owns integration and final validation.
 
-## Delegate
+## Choose model and thinking
 
-Before starting a child, identify its scope and work the manager can do concurrently. Include in the task:
+Use the cheapest model and lowest thinking level likely to succeed. Prefer cheaper models for narrow, easily validated work; use stronger models as ambiguity, scope, risk, or weak validation increases. Ensure the model can hold the relevant context.
 
-- Expected outcome and relevant context.
-- Files or areas it may and must not modify.
-- Required validation.
-- What its result must report.
+Use `off` or `minimal` for deterministic edits, `low` for bounded coding, `medium` for multi-step implementation or debugging, and `high` for difficult consequential reasoning. Reserve `xhigh` and `max` for exceptional, narrow tasks.
 
-```bash
-"$AGENTS" start NAME -- "TASK"
-```
+Increase thinking when the model understands the task but needs deeper analysis. Switch models when it lacks capability, context, or tool reliability. If a child struggles, do not repeat the same prompt: narrow the task, add evidence and acceptance criteria, then start a fresh child.
 
-Use another existing working directory when needed:
+## Start
+
+State the outcome, context, allowed files, validation, and required report:
 
 ```bash
-"$AGENTS" start NAME --cwd DIR -- "TASK"
+"$AGENTS" start NAME \
+  --model PROVIDER/MODEL \
+  --thinking LEVEL \
+  -- "TASK"
 ```
+
+Use `--cwd DIR` when the child needs another existing directory.
 
 Example:
 
 ```bash
-"$AGENTS" start auth-tests -- \
-  "Add authentication tests only under tests/auth/.
-Do not modify application code.
-Run the relevant tests.
-Report changed files, test results, and remaining risks."
+"$AGENTS" start auth-tests \
+  --model openai-codex/gpt-5.6-terra \
+  --thinking medium -- \
+  "Add tests only under tests/auth/. Do not modify application code.
+Run the relevant tests. Report changed files, results, and risks."
 ```
 
-After starting assignments, confirm they launched, then return to manager-owned work:
+Confirm launch, then resume manager work:
 
 ```bash
-"$AGENTS" status
+"$AGENTS" check
 ```
 
-## Collect and steer
+## Check and steer
 
-The helper notifies the manager when a child reaches `done`, `blocked`, or `failed`. Notifications are advisory; status and result files are authoritative. If no notification has arrived, check status only at a natural work boundary.
+The helper notifies the manager on `done`, `blocked`, or `failed`; `check` and result files remain authoritative.
 
 ```bash
-"$AGENTS" status
-"$AGENTS" result NAME
+"$AGENTS" check                         # all children
+"$AGENTS" check NAME 272000             # status, context %, and result
+"$AGENTS" send NAME "CORRECTION"
 ```
 
-For missing or questionable results, inspect recent output:
+At 40% context or more, stop extending the assignment. Collect the handoff and use a fresh child for further work.
+
+For missing or questionable results:
 
 ```bash
 "$AGENTS" capture NAME 80
 ```
 
-Send concise correction or unblock information when needed:
-
-```bash
-"$AGENTS" send NAME "DECISION OR CORRECTION"
-```
-
-Investigate `failed`, `exited`, `stopped`, prolonged `starting`, missing results, scope violations, and absent validation. For `blocked`, inspect the blocker, resolve it if practical, then redirect or stop the child.
-
-When several children are active, collect useful completed work before deciding whether the remainder blocks progress.
+Investigate failures, blockers, scope violations, and missing validation. A timeout alone is not failure.
 
 ## Wait only when blocked
 
-Wait only when the manager has exhausted useful independent work and further progress requires a specific result. Always use a bounded timeout:
+Wait only when no useful independent work remains and progress needs a specific result:
 
 ```bash
 "$AGENTS" wait NAME 900
-"$AGENTS" result NAME
+"$AGENTS" check NAME 272000
 ```
 
-Do not wait sequentially for every child. Use `wait-all` only when all remaining results form the same dependency barrier. A timeout is not proof of failure; inspect status and output before redirecting or stopping the child.
+Use bounded timeouts. Avoid sequential waits; use `wait-all` only for a shared dependency barrier.
 
 ## Integrate and close
 
-For each accepted handoff:
+Inspect the handoff and diff, check scope and conflicts, then validate from the manager session. Do not rely on the child's claims alone.
 
-1. Inspect its findings or diff and confirm scope compliance.
-2. Check for conflicts with manager and child work.
-3. Run relevant validation from the manager session.
-4. Resolve integration issues directly or send a bounded correction.
-
-Do not rely solely on a child's claims about tests or research.
-
-After handling a child, close its tab and remove its state:
+After handling a terminal child:
 
 ```bash
-"$AGENTS" stop NAME
-"$AGENTS" clean NAME
+"$AGENTS" close NAME
 ```
 
-Do not clean before collecting output needed for investigation. Before finishing, run `"$AGENTS" status` and ensure no children remain.
+`close` refuses active children. To cancel intentionally, run `stop NAME`, then `close NAME`. Before finishing, run `"$AGENTS" check` and leave no children behind.
 
-For state and notification semantics, read [references/PROTOCOL.md](references/PROTOCOL.md). For all commands, run:
-
-```bash
-"$AGENTS" help
-```
+See [references/PROTOCOL.md](references/PROTOCOL.md) for protocol details or run `"$AGENTS" help` for all commands.

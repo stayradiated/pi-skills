@@ -8,6 +8,8 @@ Each agent stores:
 - `prompt.md`: assignment and child contract
 - `result.md`: durable handoff or failure reason
 - `cwd`: working location
+- `model`: explicitly selected Pi model
+- `thinking`: explicitly selected Pi thinking level
 - `zellij-tab`: stable ID of the child's tab
 - `zellij-pane`: ID used for capture and steering
 - `parent-zellij-pane`: manager pane ID used for terminal-status notification
@@ -31,6 +33,12 @@ The child sets `running` when it begins. Before setting `done`, `blocked`, or `f
 `send` targets the child's pane. On `done`, `blocked`, or `failed`, the runner pastes a fixed message into `parent-zellij-pane` and sends Enter. In an active Pi run this becomes queued steering after the current tool-call batch. Each status is attempted once and the latest delivery outcome is recorded in `notified` or `notification-error`; status and result files remain the source of truth. Because notification uses terminal input injection, it can collide with a user draft or active dialog. Screen capture is diagnostic only. The user can always inspect or interact with the child directly in its `agent-NAME` tab.
 
 Children start with project trust, extensions, and skills disabled. Context files still load. Child processes retain the invoking user's filesystem and network access.
+
+`context NAME [CONTEXT_WINDOW]` reads the latest completed request from the child's session and estimates its active context as `input + cacheRead` tokens. Passing the model's context-window token count reports the percentage and recommends a fresh child at 40% or more. This is an estimate, not a billing record.
+
+Children may start nested children through the same helper. Nested children notify their direct parent pane; each delegating agent remains responsible for its descendants' scopes, collection, validation, and closure.
+
+The core lifecycle is `start`, `check`, optional `send`/`wait`, then `close`. `check` combines status, context usage when available, and a durable result. `close` combines stopping and cleanup but refuses active agents; intentional cancellation remains the explicit `stop` then `close` path.
 
 Environment override:
 

@@ -12,15 +12,20 @@ usage() {
   cat <<'EOF_USAGE'
 Usage: pi-zellij-agents COMMAND [ARGS]
 
-Commands:
-  doctor
+Core commands:
   start NAME [options] -- TASK
+  check [NAME [CONTEXT_WINDOW]]
   send NAME MESSAGE...
+  wait NAME [TIMEOUT_SECONDS]
+  close NAME
+
+Advanced commands:
+  doctor
   status [NAME]
   capture NAME [LINES]
   result NAME
   info NAME [--field FIELD]
-  wait NAME [TIMEOUT_SECONDS]
+  context NAME [CONTEXT_WINDOW]
   wait-all [TIMEOUT_SECONDS]
   stop NAME
   stop-all
@@ -28,6 +33,8 @@ Commands:
 
 Start options:
   --cwd DIR               Run in an existing directory (default: current directory)
+  --model REF             Pi model for the child (required)
+  --thinking LEVEL        Thinking level: off, minimal, low, medium, high, xhigh, or max (required)
 EOF_USAGE
 }
 
@@ -140,7 +147,9 @@ $task
 - Status: $status_file
 - Result: $result_file
 
-Stay within the task and working directory. Do not spawn agents, merge, rebase, or push.
+Stay within the task and working directory. Do not merge, rebase, or push.
+
+You may delegate a genuinely independent, bounded subtask when doing so is worthwhile. Start nested children with a unique name, an explicit model, and an explicit thinking level; assign non-overlapping write scopes; collect, validate, and close them before reporting your handoff. Use $SCRIPT_DIR/pi-zellij-agents as the helper.
 
 Set status atomically to \`running\` before work. Write a concise result covering outcome, evidence, changes, validation, risks, and handoff; then set status to \`done\`. If blocked or failed, write the reason and set status to \`blocked\` or \`failed\`. Remain available for steering.
 
@@ -163,7 +172,7 @@ shell_join() {
 
 cmd_start() {
   [[ $# -ge 1 ]] || die "start requires NAME"
-  local original_name=$1 name dir task='' cwd="$ROOT"
+  local original_name=$1 name dir task='' cwd="$ROOT" model='' thinking=''
   local target='' original_tab='' pi_bin
   require_zellij_session
   pi_bin=$(command -v pi) || die "pi not found"
@@ -175,12 +184,16 @@ cmd_start() {
   while [[ $# -gt 0 ]]; do
     case "$1" in
       --cwd) [[ $# -ge 2 ]] || die "--cwd requires DIR"; cwd=$2; shift 2 ;;
+      --model) [[ $# -ge 2 && -n "$2" ]] || die "--model requires REF"; model=$2; shift 2 ;;
+      --thinking) [[ $# -ge 2 && -n "$2" ]] || die "--thinking requires LEVEL"; thinking=$2; shift 2 ;;
       --) shift; task="$*"; break ;;
       *) die "unknown start option: $1" ;;
     esac
   done
 
   [[ -n "${task//[[:space:]]/}" ]] || die "task is empty"
+  [[ -n "$model" ]] || die "--model is required"
+  case "$thinking" in off|minimal|low|medium|high|xhigh|max) ;; *) die "--thinking must be off, minimal, low, medium, high, xhigh, or max" ;; esac
   [[ -d "$cwd" ]] || die "working directory not found: $cwd"
   cwd=$(cd "$cwd" && pwd -P)
 
@@ -204,12 +217,14 @@ cmd_start() {
   write_atomic "$dir/status" starting
 
   printf '%s\n' "$cwd" >"$dir/cwd"
+  printf '%s\n' "$model" >"$dir/model"
+  printf '%s\n' "$thinking" >"$dir/thinking"
   printf '%s\n' "$ZELLIJ_PANE_ID" >"$dir/parent-zellij-pane"
   printf '%s\n' "$SCRIPT_DIR/pi-zellij-agents" >"$dir/manager-cli"
   build_prompt "$name" "$dir" "$cwd" "$task"
 
   local -a pi_args
-  pi_args=("$pi_bin" --name "subagent:$name" --session-dir "$dir/session" --no-approve --no-extensions --no-skills)
+  pi_args=("$pi_bin" --name "subagent:$name" --session-dir "$dir/session" --model "$model" --thinking "$thinking" --no-approve --no-extensions --no-skills)
   pi_args+=("@$dir/prompt.md" "Execute the managed assignment in the attached brief.")
 
   local shell_cmd tab_name="agent-$name"
@@ -317,7 +332,7 @@ cmd_info() {
     case "$field" in
       name) basename "$dir" ;;
       status) status_value "$dir"; printf '\n' ;;
-      cwd|zellij-tab|zellij-pane|parent-zellij-pane) read_file "$dir/$field"; printf '\n' ;;
+      cwd|model|thinking|zellij-tab|zellij-pane|parent-zellij-pane) read_file "$dir/$field"; printf '\n' ;;
       state-dir) printf '%s\n' "$dir" ;;
       *) die "unknown field: $field" ;;
     esac
@@ -326,10 +341,60 @@ cmd_info() {
   printf 'name:       %s\n' "$(basename "$dir")"
   printf 'status:     %s\n' "$(status_value "$dir")"
   printf 'cwd:        %s\n' "$(read_file "$dir/cwd")"
+  printf 'model:      %s\n' "$(read_file "$dir/model")"
+  printf 'thinking:   %s\n' "$(read_file "$dir/thinking")"
   printf 'tab:        %s\n' "$(read_file "$dir/zellij-tab")"
   printf 'pane:       %s\n' "$(read_file "$dir/zellij-pane")"
   printf 'parent-pane: %s\n' "$(read_file "$dir/parent-zellij-pane")"
   printf 'state-dir:  %s\n' "$dir"
+}
+
+cmd_check() {
+  [[ $# -le 2 ]] || die "usage: check [NAME [CONTEXT_WINDOW]]"
+  if [[ $# -eq 0 ]]; then
+    cmd_status
+    return
+  fi
+  local name=$1 dir status session
+  dir=$(require_agent "$name")
+  status=$(status_value "$dir")
+  printf '%-22s %-9s %-12s %s\n' NAME STATUS TAB CWD
+  print_status_one "$name"
+  printf '\n'
+  session=$(find "$dir/session" -type f -name '*.jsonl' -print -quit 2>/dev/null || true)
+  if [[ -n "$session" ]] && grep -q '"usage":{' "$session"; then
+    cmd_context "$@"
+    printf '\n'
+  fi
+  if [[ -s "$dir/result.md" ]]; then
+    printf '%s\n\n' '--- result ---'
+    cat "$dir/result.md"
+  elif [[ "$status" == done || "$status" == blocked || "$status" == failed ]]; then
+    printf '(terminal status has no result)\n'
+  fi
+}
+
+cmd_context() {
+  [[ $# -ge 1 && $# -le 2 ]] || die "usage: context NAME [CONTEXT_WINDOW]"
+  local dir session usage input cache_read total window=${2:-} percent
+  dir=$(require_agent "$1")
+  session=$(find "$dir/session" -type f -name '*.jsonl' -print 2>/dev/null | head -n 1)
+  [[ -n "$session" ]] || die "no child session data yet"
+  usage=$(grep '"usage":{' "$session" | tail -n 1 || true)
+  [[ -n "$usage" ]] || die "no completed model request yet"
+  input=$(printf '%s\n' "$usage" | sed -n 's/.*"input":\([0-9][0-9]*\).*/\1/p')
+  cache_read=$(printf '%s\n' "$usage" | sed -n 's/.*"cacheRead":\([0-9][0-9]*\).*/\1/p')
+  [[ -n "$input" && -n "$cache_read" ]] || die "could not read token usage from child session"
+  total=$((input + cache_read))
+  printf 'estimated context: %s tokens (input %s + cache read %s)\n' "$total" "$input" "$cache_read"
+  if [[ -n "$window" ]]; then
+    [[ "$window" =~ ^[1-9][0-9]*$ ]] || die "CONTEXT_WINDOW must be a positive token count"
+    percent=$((total * 100 / window))
+    printf 'context window:    %s tokens (%s%% used)\n' "$window" "$percent"
+    (( percent < 40 )) || printf 'recommendation: start a fresh child rather than reusing this one.\n'
+  else
+    printf 'tip: pass the model context-window token count to see the percentage; at 40%%, prefer a fresh child.\n'
+  fi
 }
 
 wait_one() {
@@ -418,6 +483,19 @@ cmd_stop_all() {
   shopt -u nullglob
 }
 
+cmd_close() {
+  [[ $# -eq 1 ]] || die "close requires NAME"
+  local dir status
+  dir=$(require_agent "$1")
+  status=$(status_value "$dir")
+  case "$status" in
+    done|blocked|failed|exited|stopped) ;;
+    *) die "agent is $status; close only accepts terminal agents (use stop first to cancel it)" ;;
+  esac
+  cmd_stop "$1"
+  cmd_clean "$1"
+}
+
 cmd_clean() {
   [[ $# -eq 1 ]] || die "clean requires NAME"
   local name=$1 dir target
@@ -438,15 +516,18 @@ main() {
   case "$cmd" in
     doctor) cmd_doctor "$@" ;;
     start) cmd_start "$@" ;;
+    check) cmd_check "$@" ;;
     send) cmd_send "$@" ;;
     status) cmd_status "$@" ;;
     capture) cmd_capture "$@" ;;
     result) cmd_result "$@" ;;
     info) cmd_info "$@" ;;
+    context) cmd_context "$@" ;;
     wait) cmd_wait "$@" ;;
     wait-all) cmd_wait_all "$@" ;;
     stop) cmd_stop "$@" ;;
     stop-all) cmd_stop_all "$@" ;;
+    close) cmd_close "$@" ;;
     clean) cmd_clean "$@" ;;
     -h|--help|help) usage ;;
     *) usage >&2; die "unknown command: $cmd" ;;

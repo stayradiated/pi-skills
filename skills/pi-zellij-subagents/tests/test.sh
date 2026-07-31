@@ -128,7 +128,8 @@ expect_status 1 status .
 expect_status 1 status ..
 
 # Start opens a tab in this session and launches Pi with safe resource defaults.
-run start smoke --cwd "$TMP/project" -- "Perform a smoke test." >/dev/null
+expect_status 1 start missing-options -- "Must specify model and thinking."
+run start smoke --cwd "$TMP/project" --model test/model --thinking low -- "Perform a smoke test." >/dev/null
 for _ in {1..50}; do
   [[ -s "$ARGS_FILE" && -s "$STATE/agents/smoke/zellij-pane" ]] && break
   sleep 0.1
@@ -142,7 +143,15 @@ pane=$(run info smoke --field zellij-pane)
 grep -Fx -- '--no-approve' "$ARGS_FILE" >/dev/null
 grep -Fx -- '--no-extensions' "$ARGS_FILE" >/dev/null
 grep -Fx -- '--no-skills' "$ARGS_FILE" >/dev/null
+grep -Fx -- '--model' "$ARGS_FILE" >/dev/null
+grep -Fx -- 'test/model' "$ARGS_FILE" >/dev/null
+grep -Fx -- '--thinking' "$ARGS_FILE" >/dev/null
+grep -Fx -- 'low' "$ARGS_FILE" >/dev/null
+[[ "$(run info smoke --field model)" == test/model ]]
+[[ "$(run info smoke --field thinking)" == low ]]
 # A leading dash in a steering message must be treated as content, not an option.
+run check smoke >/dev/null
+expect_status 1 close smoke
 run send smoke "--Test steering" >/dev/null
 run capture smoke 5 >/dev/null
 run stop smoke >/dev/null
@@ -153,7 +162,7 @@ mkdir -p "$TMP/other-project"
 run_relative() {
   (cd "$TMP/project" && env PATH="$TMP/bin:$PATH" PI_ZELLIJ_STATE_DIR=relative-state "$CLI" "$@")
 }
-run_relative start relative --cwd "$TMP/other-project" -- "Test relative state." >/dev/null
+run_relative start relative --cwd "$TMP/other-project" --model test/model --thinking medium -- "Test relative state." >/dev/null
 for _ in {1..50}; do
   [[ -s "$TMP/project/relative-state/agents/relative/zellij-pane" ]] && break
   sleep 0.1
@@ -171,6 +180,21 @@ set +e
 outside_rc=$?
 set -e
 [[ $outside_rc -ne 0 ]]
+
+# Context reports the latest request's input plus cache-read tokens and warns at 40%.
+mkdir -p "$STATE/agents/context-agent/session"
+printf '%s\n' '{"usage":{"input":300,"cacheRead":200}}' >"$STATE/agents/context-agent/session/test.jsonl"
+printf '%s\n' running >"$STATE/agents/context-agent/status"
+context_output=$(run context context-agent 1000)
+grep -F -- 'estimated context: 500 tokens (input 300 + cache read 200)' <<<"$context_output" >/dev/null
+grep -F -- 'context window:    1000 tokens (50% used)' <<<"$context_output" >/dev/null
+grep -F -- 'recommendation: start a fresh child' <<<"$context_output" >/dev/null
+printf '%s\n' done >"$STATE/agents/context-agent/status"
+check_output=$(run check context-agent 1000)
+grep -F -- 'context-agent' <<<"$check_output" >/dev/null
+grep -F -- '50% used' <<<"$check_output" >/dev/null
+run close context-agent >/dev/null
+[[ ! -e "$STATE/agents/context-agent" ]]
 
 # wait-all distinguishes blocked and failed batches without requiring live tabs.
 mkdir -p "$STATE/agents/done-agent" "$STATE/agents/blocked-agent"
