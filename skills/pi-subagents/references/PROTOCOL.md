@@ -2,7 +2,7 @@
 
 State defaults to `<project-root>/.pi/subagents/`, with `PI_SUBAGENT_STATE_DIR` as an override. Root managers are scoped by `PI_SESSION_ID`; nested managers use their own agent record. Names are unique only among a manager's direct children.
 
-Each child stores its status, prompt, result, working directory, model, thinking level, hierarchy, backend, multiplexer session, target IDs, parent endpoint, and Pi session data. Persisted status is one of `starting`, `running`, `blocked`, `done`, `failed`, or `stopped`. A missing live target is reported dynamically as `exited`; an uncompleted managed steering generation is reported as `steering` so an older terminal status cannot satisfy `wait`.
+Each child stores its status, prompt, result, working directory, model, thinking level, hierarchy, backend, multiplexer session, target IDs, parent endpoint, and Pi session data. Persisted status is one of `starting`, `running`, `blocked`, `done`, `failed`, or `stopped`. The runner records `running` atomically before the child command begins, so `starting` covers launch only. A missing live target is reported dynamically as `exited`; an uncompleted managed steering generation is reported as `steering` so an older terminal status cannot satisfy `wait`.
 
 Commands operate only on the invoking manager's direct children. Nested delegation uses the same interface, and hierarchy metadata is informational. A child must close its own direct children before completion; `close` refuses while child records remain.
 

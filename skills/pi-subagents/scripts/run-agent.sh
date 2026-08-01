@@ -42,7 +42,7 @@ notify_parent() {
     return 0
   fi
 
-  printf -v message "[pi-subagents] Direct child '%s' reached status '%s' (generation %s). Its durable handoff is available until close: %q result %q" \
+  printf -v message "[pi-subagents] child %q -> %s (gen %s); handoff %q result %q" \
     "$name" "$status" "$generation" "$manager_cli" "$name"
   case "$backend" in
     tmux)
@@ -76,6 +76,9 @@ case "$backend" in
   tmux) [[ -z "${TMUX_PANE:-}" ]] || write_atomic "$agent_dir/pane" "$TMUX_PANE" ;;
   zellij) [[ -z "${ZELLIJ_PANE_ID:-}" ]] || write_atomic "$agent_dir/pane" "$ZELLIJ_PANE_ID" ;;
 esac
+if [[ "$(read_state_file "$agent_dir/status")" == starting ]]; then
+  write_atomic "$agent_dir/status" running
+fi
 
 watch_status &
 watcher_pid=$!

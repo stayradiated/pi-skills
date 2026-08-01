@@ -58,7 +58,18 @@ for _ in {1..50}; do [[ -s "$STATE/managers/test-manager/children/tmux-child/pan
 TMUX_DIR="$STATE/managers/test-manager/children/tmux-child"
 [[ "$(cat "$TMUX_DIR/backend")" == tmux ]]
 [[ "$(cat "$TMUX_DIR/multiplexer-session")" == "$TMUX_SESSION" ]]
-[[ "$(run info tmux-child --field status)" == starting ]]
+for _ in {1..50}; do [[ "$(run info tmux-child --field status)" == running ]] && break; sleep 0.1; done
+[[ "$(run info tmux-child --field status)" == running ]]
+grep -F '## Task' "$TMUX_DIR/prompt.md" >/dev/null
+grep -F 'tmux smoke' "$TMUX_DIR/prompt.md" >/dev/null
+for forbidden in 'Hierarchy:' 'Helper:' 'Cwd:' 'Stay available for steering.' 'Before work, atomically write'; do
+  if grep -F -- "$forbidden" "$TMUX_DIR/prompt.md" >/dev/null; then
+    printf 'unexpected prompt content: %s\n' "$forbidden" >&2
+    exit 1
+  fi
+done
+grep -F 'Close your direct children before any terminal status.' "$TMUX_DIR/prompt.md" >/dev/null
+grep -F 'Write the result to' "$TMUX_DIR/prompt.md" >/dev/null
 grep -Fx -- '--model' "$ARGS_FILE" >/dev/null
 grep -Fx -- '--thinking' "$ARGS_FILE" >/dev/null
 for forbidden in --no-skills --no-extensions --no-approve; do
@@ -92,7 +103,7 @@ rmdir "$TMUX_DIR/send-lock"
 recorder_pid=$!
 send_output=$(run send tmux-child "--steer")
 wait "$recorder_pid"
-grep -F 'agent completion pending' <<<"$send_output" >/dev/null
+grep -F 'completion pending' <<<"$send_output" >/dev/null
 [[ "$(run info tmux-child --field status)" == steering ]]
 generation=$(cat "$TMUX_DIR/steering-pending")
 [[ "$(cat "$TMUX_DIR/steering-ack")" == "$generation" ]]
@@ -186,6 +197,7 @@ expect_status 0 wait-all 1
 NOTIFY="$TMP/notify"
 FAKE="$TMP/fake"
 LOG="$TMP/notify.log"
+MSG_LOG="$TMP/notify-message.log"
 mkdir -p "$NOTIFY" "$FAKE"
 printf '%s\n' zellij >"$NOTIFY/backend"
 printf '%s\n' zellij >"$NOTIFY/parent-backend"
@@ -197,6 +209,10 @@ cat >"$FAKE/zellij" <<'EOF'
 #!/usr/bin/env bash
 printf '%q ' "$@" >>"$NOTIFY_LOG"
 printf '\n' >>"$NOTIFY_LOG"
+if [[ "${3:-}" == action && "${4:-}" == paste ]]; then
+  printf '%s\n' "${@: -1}" >>"$NOTIFY_MSG_LOG"
+fi
+exit 0
 EOF
 cat >"$FAKE/finish" <<'EOF'
 #!/usr/bin/env bash
@@ -204,8 +220,14 @@ printf '%s\n' 'done' >"$1.tmp"
 mv "$1.tmp" "$1"
 EOF
 chmod +x "$FAKE/zellij" "$FAKE/finish"
-env PATH="$FAKE:$PATH" NOTIFY_LOG="$LOG" "$RUNNER" "$NOTIFY" finish "$NOTIFY/status"
+env PATH="$FAKE:$PATH" NOTIFY_LOG="$LOG" NOTIFY_MSG_LOG="$MSG_LOG" "$RUNNER" "$NOTIFY" finish "$NOTIFY/status"
 [[ "$(cat "$NOTIFY/notified")" == 'done' ]]
+STOPPED="$TMP/stopped"
+mkdir -p "$STOPPED"
+printf '%s\n' stopped >"$STOPPED/status"
+env PATH="$FAKE:$PATH" "$RUNNER" "$STOPPED" true
+[[ "$(cat "$STOPPED/status")" == stopped ]]
 [[ "$(grep -c 'action paste' "$LOG")" -eq 1 ]]
+grep -F "[pi-subagents] child $(basename "$NOTIFY") -> done" "$MSG_LOG" >/dev/null
 
 printf 'ok: pi-subagents tests passed\n'

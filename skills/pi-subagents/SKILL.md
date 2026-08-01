@@ -1,6 +1,6 @@
 ---
 name: pi-subagents
-description: Delegate bounded tasks to observable Pi subagents in tmux or Zellij. Use when research, implementation, testing, or review can run independently or in parallel, when the user asks for a subagent, or when another skill needs delegated work.
+description: Use when delegating research, implementation, testing, or review to observable Pi subagents in tmux or Zellij.
 compatibility: Requires Bash, Pi, and an active tmux or Zellij session.
 ---
 
@@ -8,45 +8,31 @@ compatibility: Requires Bash, Pi, and an active tmux or Zellij session.
 
 Resolve `scripts/pi-subagents` relative to this file as the absolute path `AGENTS`.
 
-The manager owns decomposition, integration, validation, and the final answer. Each Pi session manages only its **direct children**; a child independently owns any children it starts. Children share the user's filesystem and permissions—they are observable workers, not sandboxes or automatic worktrees.
+The manager owns decomposition, integration, validation, and the final answer. Each Pi session manages only its direct children; children may start their own children, and all workers share the user's filesystem and permissions.
 
-## 1. Scope one assignment
+## Assign and start
 
-Delegate when a task can proceed independently and delegation is cheaper than doing it directly. Define:
+Give the child a goal and a checkable completion condition. Include context the child cannot discover itself. Specify write boundaries only when concurrent work could conflict. Include the required handoff: outcome, evidence, changed files, validation, and risks.
 
-- one bounded outcome;
-- the context needed to act;
-- an exclusive write scope;
-- explicit validation;
-- the required handoff: outcome, evidence, changed files, validation, and risks.
+Strongly prefer OpenAI Codex GPT-5.6 agents and switch variants per assignment:
 
-Active children have exclusive ownership of their write scopes. Use a fresh child for each assignment.
+- `openai-codex/gpt-5.6-luna` for work that does not require complex decisions, such as lookup, summarization, test execution, and straightforward analysis.
+- `openai-codex/gpt-5.6-terra` for any coding or code-modification task; use it as the default implementation agent.
+- `openai-codex/gpt-5.6-sol` sparingly, only for difficult architecture, ambiguous trade-offs, or complex reasoning that Luna or Terra is unlikely to resolve.
 
-Choose the cheapest known model and lowest thinking level likely to succeed: `off` or `minimal` for deterministic edits, `low` for bounded coding, `medium` for multi-step work, and `high` for difficult reasoning. Use `pi --list-models` to discover model references. If no cheaper compatible model is known, reuse `$PI_PROVIDER/$PI_MODEL`; do not guess a model name.
-
-**Complete when:** the assignment has one outcome, an unambiguous scope, and checkable acceptance criteria.
-
-## 2. Start and confirm
-
-The helper reuses the tmux or Zellij session containing the manager:
+Do not default every child to Sol. Use the lowest thinking level likely to succeed. If GPT-5.6 is unavailable, use a known compatible model; do not guess model names.
 
 ```bash
 "$AGENTS" start NAME \
   --model PROVIDER/MODEL \
   --thinking LEVEL -- \
-  "OUTCOME. CONTEXT. WRITE SCOPE. VALIDATION. REQUIRED HANDOFF."
+  "GOAL. NON-DISCOVERABLE CONTEXT. CONFLICT WRITE BOUNDARIES. COMPLETION CHECK. HANDOFF."
 "$AGENTS" check NAME
 ```
 
-Use `--cwd DIR` for another existing directory. For backend overrides or invocation outside a multiplexer, follow [Backend and session selection](references/PROTOCOL.md#backend-and-session-selection).
+Use `--cwd DIR` for another existing directory. Outside a multiplexer, pass `--session NAME` for an existing session. `READY=target` means the target exists but no pane is recorded; `READY=ready` means it is addressable. `STATUS=starting` means launch is pending; `running` means the child command has started.
 
-`READY=target` means the multiplexer target exists but its Pi pane is not recorded yet; `READY=ready` means the pane is addressable. `STATUS=starting` means the child has not acknowledged the assignment, while `running` means it has.
-
-**Complete when:** `start` reports a backend, session, and target, and `check NAME` confirms an addressable pane and a live or completed launch.
-
-## 3. Continue, check, and steer
-
-Resume manager-owned work after launch. A child notifies its direct parent on `done`, `blocked`, or `failed`; durable state remains authoritative.
+## Continue and steer
 
 ```bash
 "$AGENTS" check NAME CONTEXT_WINDOW
@@ -54,38 +40,18 @@ Resume manager-owned work after launch. A child notifies its direct parent on `d
 "$AGENTS" capture NAME 80
 ```
 
-`send` queues a managed steering generation; transport success does not mean the child consumed it. While that generation is incomplete, `check` reports `steering` and `wait` will not accept an older terminal status. Confirm the acknowledgement and revised handoff. Use a fresh child instead of steering a blocked or failed child.
+`send` records a steering generation before injection. While it is incomplete, `check` reports `steering` and `wait` stays pending. Confirm the acknowledgement and revised handoff. Use a fresh child instead of steering a blocked or failed child. At 40% context or more, collect the handoff and use a fresh child.
 
-`check NAME` includes the durable result when one exists. At 40% context or more, collect the current handoff and use a fresh child for further work. When a result is the current dependency and no useful independent work remains, wait with a bounded timeout:
+## Integrate and close
+
+Read the handoff, inspect claimed changes, check scope and conflicts, and validate from the manager session. Treat the handoff as evidence requiring verification.
 
 ```bash
 "$AGENTS" wait NAME 900
-```
-
-**Complete when:** the child has a terminal status and a durable result, or its blocker has been identified and acted on.
-
-## 4. Integrate and validate
-
-Read the handoff, inspect every claimed change, check scope and conflicts, and run validation from the manager session. Treat the child result as evidence requiring manager verification.
-
-**Complete when:** every claimed change and validation result has been independently accounted for, and manager-tree validation passes.
-
-## 5. Close every direct child
-
-After handling a terminal child:
-
-```bash
 "$AGENTS" close NAME
-```
-
-`close` preserves hierarchy ownership by refusing active children and children that still own agent records, then removes the child's target and state. Collect any result or trace you need before closing. For intentional cancellation, use `stop NAME`, inspect the retained state, then `close NAME`.
-
-Before reporting the overall task complete:
-
-```bash
 "$AGENTS" check
 ```
 
-**Complete when:** `check` reports no direct children and every collected handoff has been integrated or deliberately rejected.
+`close` refuses active children and children that still own agent records, then removes the child's target and state. Collect any result before closing. Finish only when no direct children remain and every handoff is integrated or deliberately rejected.
 
 See [references/PROTOCOL.md](references/PROTOCOL.md) for state and transport semantics, or run `"$AGENTS" help` for the full command surface.

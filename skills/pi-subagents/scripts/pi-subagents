@@ -215,23 +215,13 @@ build_prompt() {
 
 $task
 
-## Context
+Close your direct children before any terminal status.
 
-- Hierarchy: $path
-- Subagent helper: $SCRIPT_DIR/pi-subagents
-- Working directory: $cwd
-- Status: $status_file
-- Result: $result_file
-
-Stay within the assigned outcome and write scope. Do not merge, rebase, or push. You are a direct child of the invoking manager. You may use the pi-subagents skill normally; any agents you start are your direct children, and you alone manage them. Close all of your direct children before reporting completion.
-
-Set status atomically to \`running\` before work. Write a concise result covering outcome, evidence, changes, validation, risks, and handoff; then set status to \`done\`. If blocked or failed, write the reason and set status to \`blocked\` or \`failed\`. Remain available for steering.
-
-Status update:
+When finished, write a concise result (outcome, evidence, changed files, validation, risks, handoff). Immediately before a terminal status, atomically write it:
 
     printf '%s\\n' STATUS > $q_status.tmp && mv $q_status.tmp $q_status
 
-Write the result to $q_result. Begin now.
+Use \`done\`, \`blocked\`, or \`failed\`; record why when blocked or failed. Write the result to $q_result. Begin now.
 EOF
 }
 
@@ -311,7 +301,7 @@ cmd_start() {
 
   local -a pi_args env_args
   pi_args=("$pi_bin" --name "subagent:$name" --session-dir "$dir/session" --model "$model" --thinking "$thinking")
-  pi_args+=("@$dir/prompt.md" "Execute the managed assignment in the attached brief.")
+  pi_args+=("@$dir/prompt.md" "Proceed.")
   env_args=(env "PI_SUBAGENT_STATE_DIR=$STATE_DIR" "PI_SUBAGENT_SELF_DIR=$dir" "PI_SUBAGENT_PATH=$path")
   shell_cmd=$(shell_join "$RUNNER" "$dir" "${env_args[@]}" "${pi_args[@]}")
   launch_target "$backend" "$session" "$name" "$cwd" "$shell_cmd" "$dir"
@@ -384,14 +374,13 @@ cmd_send() (
   wrapped=$(cat <<EOF
 [pi-subagents steering $generation]
 
-REQUEST — complete this now:
 $user_message
 
-Update the durable handoff for this request. Immediately before setting a terminal status, complete this steering generation:
+Before any terminal status, atomically write:
 
     printf '%s\\n' $generation > $q_completed.tmp && mv $q_completed.tmp $q_completed
 
-Finish the request, update the handoff, complete the generation, and set status to done in this turn. If blocked or failed, record the reason, complete the generation, then set the corresponding terminal status.
+Then update the handoff and set the terminal status. If blocked or failed, record why, complete the generation, and set that status.
 EOF
 )
   case "$backend" in
@@ -424,7 +413,7 @@ EOF
     return 1
   fi
   refresh_steering_ack "$dir"
-  printf 'queued steering %s for %s; agent completion pending\n' "$generation" "$(basename "$dir")"
+  printf 'queued steering %s for %s; completion pending\n' "$generation" "$(basename "$dir")"
 )
 
 print_status_one() {
