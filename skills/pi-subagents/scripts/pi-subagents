@@ -175,14 +175,33 @@ target_alive() {
   esac
 }
 
+steering_pending() {
+  local dir=$1 pending completed
+  pending=$(read_file "$dir/steering-pending")
+  [[ -n "$pending" ]] || return 1
+  completed=$(read_file "$dir/steering-completed")
+  [[ "$pending" != "$completed" ]]
+}
+
 status_value() {
   local dir=$1 status
   status=$(read_file "$dir/status")
   case "$status" in starting|running|blocked|done|failed|stopped) ;; *) status=unknown ;; esac
-  if [[ "$status" == starting || "$status" == running ]]; then
+  if [[ "$status" != stopped ]] && steering_pending "$dir"; then
+    target_alive "$dir" && status=steering || status=exited
+  elif [[ "$status" == starting || "$status" == running ]]; then
     [[ -z "$(read_file "$dir/target")" ]] || target_alive "$dir" || status=exited
   fi
   printf '%s' "$status"
+}
+
+readiness_value() {
+  local dir=$1
+  if target_alive "$dir"; then
+    [[ -n "$(read_file "$dir/pane")" ]] && printf ready || printf target
+  else
+    printf no
+  fi
 }
 
 build_prompt() {
@@ -308,24 +327,112 @@ get_child_pane() {
   die "missing pane ID for $(basename "$dir")"
 }
 
-cmd_send() {
+steering_recorded() {
+  local dir=$1 generation=$2 file
+  shopt -s nullglob
+  local files=("$dir/session"/*.jsonl)
+  shopt -u nullglob
+  for file in "${files[@]}"; do grep -Fq "$generation" "$file" && return 0; done
+  return 1
+}
+
+refresh_steering_ack() {
+  local dir=$1 pending
+  pending=$(read_file "$dir/steering-pending")
+  [[ -n "$pending" ]] || return 0
+  [[ "$pending" == "$(read_file "$dir/steering-ack")" ]] && return 0
+  steering_recorded "$dir" "$pending" && write_atomic "$dir/steering-ack" "$pending"
+  return 0
+}
+
+steering_queued_visible() {
+  local backend=$1 session=$2 pane=$3 generation=$4 marker
+  marker="Follow-up: [pi-subagents steering $generation]"
+  case "$backend" in
+    tmux) tmux capture-pane -p -J -S -80 -t "$pane" 2>/dev/null | grep -Fq "$marker" ;;
+    zellij) zellij --session "$session" action dump-screen --full --pane-id "$pane" 2>/dev/null | grep -Fq "$marker" ;;
+  esac
+}
+
+submit_steering_key() {
+  local backend=$1 session=$2 pane=$3
+  case "$backend" in
+    tmux) tmux send-keys -t "$pane" M-Enter ;;
+    zellij) zellij --session "$session" action send-keys --pane-id "$pane" "Alt Enter" ;;
+  esac
+}
+
+cmd_send() (
   [[ $# -ge 2 ]] || die "send requires NAME and MESSAGE"
-  local dir backend session pane message buffer; dir=$(require_agent "$1"); shift; message="$*"
+  local dir backend session pane user_message wrapped buffer status generation sent=0 injected=0 attempts polls lock
+  local previous_pending q_completed
+  dir=$(require_agent "$1"); shift; user_message="$*"
   target_alive "$dir" || die "child target is not alive"
   backend=$(read_file "$dir/backend"); session=$(read_file "$dir/multiplexer-session"); pane=$(get_child_pane "$dir")
+  lock="$dir/send-lock"
+  mkdir "$lock" 2>/dev/null || die "another send is already in progress for $(basename "$dir")"
+  trap 'rmdir "$lock" 2>/dev/null || true' EXIT
+
+  steering_pending "$dir" && die "child already has uncompleted steering; inspect it before sending again"
+  status=$(status_value "$dir")
+  case "$status" in blocked|failed|exited|stopped) die "child is $status; collect its handoff and use a fresh child" ;; esac
+
+  generation="$(date +%s)-$$-$RANDOM"
+  previous_pending=$(read_file "$dir/steering-pending")
+  write_atomic "$dir/steering-pending" "$generation"
+  printf -v q_completed '%q' "$dir/steering-completed"
+  wrapped=$(cat <<EOF
+[pi-subagents steering $generation]
+
+REQUEST — complete this now:
+$user_message
+
+Update the durable handoff for this request. Immediately before setting a terminal status, complete this steering generation:
+
+    printf '%s\\n' $generation > $q_completed.tmp && mv $q_completed.tmp $q_completed
+
+Finish the request, update the handoff, complete the generation, and set status to done in this turn. If blocked or failed, record the reason, complete the generation, then set the corresponding terminal status.
+EOF
+)
   case "$backend" in
-    tmux) buffer="pi-subagent-$RANDOM-$$"; printf '%s' "$message" | tmux load-buffer -b "$buffer" -; tmux paste-buffer -b "$buffer" -d -t "$pane"; tmux send-keys -t "$pane" Enter ;;
-    zellij) zellij --session "$session" action paste --pane-id "$pane" -- "$message"; zellij --session "$session" action send-keys --pane-id "$pane" Enter ;;
+    tmux)
+      buffer="pi-subagent-$RANDOM-$$"
+      if printf '%s' "$wrapped" | tmux load-buffer -b "$buffer" - && tmux paste-buffer -b "$buffer" -d -t "$pane"; then injected=1; fi
+      ;;
+    zellij)
+      zellij --session "$session" action paste --pane-id "$pane" -- "$wrapped" && injected=1
+      ;;
   esac
-  printf 'sent to %s\n' "$(basename "$dir")"
-}
+  if (( !injected )); then
+    if [[ -n "$previous_pending" ]]; then write_atomic "$dir/steering-pending" "$previous_pending"; else rm -f "$dir/steering-pending"; fi
+    die "failed to inject steering into $(basename "$dir")"
+  fi
+
+  # Pi uses Alt+Enter for follow-ups. Startup and paste processing are
+  # asynchronous, so retry only the submit key until Pi shows the queued message
+  # or records it in the session; never paste the request twice.
+  sleep 0.2
+  for ((attempts = 0; attempts < 10 && !sent; attempts++)); do
+    submit_steering_key "$backend" "$session" "$pane" || true
+    for ((polls = 0; polls < 4; polls++)); do
+      sleep 0.25
+      if steering_recorded "$dir" "$generation" || steering_queued_visible "$backend" "$session" "$pane" "$generation"; then sent=1; break; fi
+    done
+  done
+  if (( !sent )); then
+    err "steering was pasted into $(basename "$dir"), but submission was not confirmed; inspect with capture"
+    return 1
+  fi
+  refresh_steering_ack "$dir"
+  printf 'queued steering %s for %s; agent completion pending\n' "$generation" "$(basename "$dir")"
+)
 
 print_status_one() {
   local dir=$1
-  printf '%-22s %-9s %-8s %-20s %s\n' "$(basename "$dir")" "$(status_value "$dir")" "$(read_file "$dir/backend")" "$(read_file "$dir/multiplexer-session")" "$(read_file "$dir/cwd")"
+  printf '%-22s %-9s %-6s %-8s %-20s %s\n' "$(basename "$dir")" "$(status_value "$dir")" "$(readiness_value "$dir")" "$(read_file "$dir/backend")" "$(read_file "$dir/multiplexer-session")" "$(read_file "$dir/cwd")"
 }
 cmd_status() {
-  printf '%-22s %-9s %-8s %-20s %s\n' NAME STATUS BACKEND SESSION CWD
+  printf '%-22s %-9s %-6s %-8s %-20s %s\n' NAME STATUS READY BACKEND SESSION CWD
   if [[ $# -gt 0 ]]; then print_status_one "$(require_agent "$1")"; return; fi
   ensure_dirs; local found=0 dir; shopt -s nullglob
   for dir in "$AGENTS_DIR"/*; do found=1; print_status_one "$dir"; done
@@ -343,23 +450,41 @@ cmd_result() {
   local dir; [[ $# -ge 1 ]] || die "result requires NAME"; dir=$(require_agent "$1")
   printf 'status: %s\n\n' "$(status_value "$dir")"; [[ -s "$dir/result.md" ]] && cat "$dir/result.md" || printf '(no result yet)\n'
 }
+latest_session_file() {
+  local dir=$1 file latest=''
+  shopt -s nullglob
+  local files=("$dir/session"/*.jsonl)
+  shopt -u nullglob
+  for file in "${files[@]}"; do [[ -z "$latest" || "$file" -nt "$latest" ]] && latest=$file; done
+  [[ -n "$latest" ]] && printf '%s' "$latest"
+}
+
 cmd_context() {
   [[ $# -ge 1 && $# -le 2 ]] || die "usage: context NAME [CONTEXT_WINDOW]"
-  local dir session usage input cache total window=${2:-} percent
-  dir=$(require_agent "$1"); session=$(find "$dir/session" -type f -name '*.jsonl' -print -quit 2>/dev/null || true)
+  local dir session line input='' cache='' candidate_input candidate_cache total window=${2:-} percent
+  local usage_re='"usage":\{"input":([0-9]+),"output":[0-9]+,"cacheRead":([0-9]+)'
+  dir=$(require_agent "$1"); session=$(latest_session_file "$dir" || true)
   [[ -n "$session" ]] || die "no child session data yet"
-  usage=$(grep '"usage":{' "$session" | tail -n 1 || true); [[ -n "$usage" ]] || die "no completed model request yet"
-  input=$(printf '%s\n' "$usage" | sed -n 's/.*"input":\([0-9][0-9]*\).*/\1/p'); cache=$(printf '%s\n' "$usage" | sed -n 's/.*"cacheRead":\([0-9][0-9]*\).*/\1/p')
-  [[ -n "$input" && -n "$cache" ]] || die "could not read token usage"
+  while IFS= read -r line; do
+    if [[ "$line" =~ $usage_re ]]; then
+      candidate_input=${BASH_REMATCH[1]}; candidate_cache=${BASH_REMATCH[2]}
+      if (( candidate_input + candidate_cache > 0 )); then input=$candidate_input; cache=$candidate_cache; fi
+    fi
+  done <"$session"
+  [[ -n "$input" && -n "$cache" ]] || die "no meaningful completed model request yet"
   total=$((input + cache)); printf 'estimated context: %s tokens (input %s + cache read %s)\n' "$total" "$input" "$cache"
   if [[ -n "$window" ]]; then [[ "$window" =~ ^[1-9][0-9]*$ ]] || die "CONTEXT_WINDOW must be positive"; percent=$((total * 100 / window)); printf 'context window:    %s tokens (%s%% used)\n' "$window" "$percent"; (( percent < 40 )) || printf 'recommendation: start a fresh child rather than reusing this one.\n'; fi
 }
 cmd_check() {
   [[ $# -le 2 ]] || die "usage: check [NAME [CONTEXT_WINDOW]]"
   if [[ $# -eq 0 ]]; then cmd_status; return; fi
-  local dir session; dir=$(require_agent "$1"); cmd_status "$1"; printf '\n'
-  session=$(find "$dir/session" -type f -name '*.jsonl' -print -quit 2>/dev/null || true)
+  local dir session; dir=$(require_agent "$1"); refresh_steering_ack "$dir"; cmd_status "$1"; printf '\n'
+  session=$(latest_session_file "$dir" || true)
   if [[ -n "$session" ]] && grep -q '"usage":{' "$session"; then cmd_context "$@"; printf '\n'; fi
+  if steering_pending "$dir"; then
+    printf 'steering pending:   %s\n' "$(read_file "$dir/steering-pending")"
+    printf 'steering ack:       %s\n\n' "$(read_file "$dir/steering-ack")"
+  fi
   if [[ -s "$dir/result.md" ]]; then printf '%s\n\n' '--- result ---'; cat "$dir/result.md"; fi
 }
 cmd_info() {
@@ -370,13 +495,13 @@ cmd_info() {
 }
 
 wait_one() {
-  local name=$1 timeout=$2 started now status; started=$(date +%s)
-  while :; do status=$(status_value "$(require_agent "$name")"); case "$status" in done) printf '%s done\n' "$name"; return 0 ;; blocked) printf '%s blocked\n' "$name"; return 2 ;; failed|exited|stopped) printf '%s %s\n' "$name" "$status"; return 1 ;; esac; now=$(date +%s); if (( timeout > 0 && now - started >= timeout )); then printf '%s timeout\n' "$name"; return 124; fi; sleep 2; done
+  local name=$1 timeout=$2 started now status dir; started=$(date +%s)
+  while :; do dir=$(require_agent "$name"); refresh_steering_ack "$dir"; status=$(status_value "$dir"); case "$status" in done) printf '%s done\n' "$name"; return 0 ;; blocked) printf '%s blocked\n' "$name"; return 2 ;; failed|exited|stopped) printf '%s %s\n' "$name" "$status"; return 1 ;; esac; now=$(date +%s); if (( timeout > 0 && now - started >= timeout )); then printf '%s timeout\n' "$name"; return 124; fi; sleep 2; done
 }
 cmd_wait() { [[ $# -ge 1 ]] || die "wait requires NAME"; local timeout=${2:-0}; [[ "$timeout" =~ ^[0-9]+$ ]] || die "timeout must be non-negative"; wait_one "$1" "$timeout"; }
 cmd_wait_all() {
   local timeout=${1:-0} started now pending failed blocked dir status; [[ "$timeout" =~ ^[0-9]+$ ]] || die "timeout must be non-negative"; started=$(date +%s)
-  while :; do pending=0; failed=0; blocked=0; shopt -s nullglob; local dirs=("$AGENTS_DIR"/*); shopt -u nullglob; ((${#dirs[@]})) || { printf '(no direct children)\n'; return 0; }; for dir in "${dirs[@]}"; do status=$(status_value "$dir"); case "$status" in starting|running|unknown) pending=1 ;; blocked) blocked=1 ;; failed|exited|stopped) failed=1 ;; esac; done; if (( !pending )); then cmd_status; (( !failed )) || return 1; (( !blocked )) || return 2; return 0; fi; now=$(date +%s); if (( timeout > 0 && now - started >= timeout )); then cmd_status; return 124; fi; sleep 2; done
+  while :; do pending=0; failed=0; blocked=0; shopt -s nullglob; local dirs=("$AGENTS_DIR"/*); shopt -u nullglob; ((${#dirs[@]})) || { printf '(no direct children)\n'; return 0; }; for dir in "${dirs[@]}"; do status=$(status_value "$dir"); case "$status" in starting|running|steering|unknown) pending=1 ;; blocked) blocked=1 ;; failed|exited|stopped) failed=1 ;; esac; done; if (( !pending )); then cmd_status; (( !failed )) || return 1; (( !blocked )) || return 2; return 0; fi; now=$(date +%s); if (( timeout > 0 && now - started >= timeout )); then cmd_status; return 124; fi; sleep 2; done
 }
 
 close_target() {
@@ -399,9 +524,12 @@ cmd_clean() {
 }
 cmd_close() {
   [[ $# -eq 1 ]] || die "close requires NAME"; local dir status; dir=$(require_agent "$1")
+  [[ ! -d "$dir/send-lock" ]] || die "child has a send in progress"
   if has_children "$dir"; then err "child '$(basename "$dir")' still owns direct children:"; list_children "$dir"; die "ask that child to close its children first"; fi
   status=$(status_value "$dir"); case "$status" in done|blocked|failed|exited|stopped) ;; *) die "child is $status; close accepts terminal children only (use stop to cancel)" ;; esac
-  cmd_stop "$1"; cmd_clean "$1"
+  target_alive "$dir" && close_target "$dir" || true
+  printf 'closed %s\n' "$(basename "$dir")"
+  cmd_clean "$1"
 }
 cmd_doctor() {
   local failed=0 active; for c in bash pi; do if has "$c"; then printf 'ok   %-8s %s\n' "$c" "$(command -v "$c")"; else printf 'MISS %-8s not found\n' "$c"; failed=1; fi; done

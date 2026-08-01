@@ -17,11 +17,20 @@ notification_error_file="$agent_dir/notification-error"
 read_state_file() { [[ -f "$1" ]] && cat "$1" || true; }
 write_atomic() { local path=$1 value=$2; printf '%s\n' "$value" >"$path.tmp"; mv "$path.tmp" "$path"; }
 
+terminal_generation() {
+  local pending completed
+  pending=$(read_state_file "$agent_dir/steering-pending")
+  completed=$(read_state_file "$agent_dir/steering-completed")
+  [[ -z "$pending" || "$pending" == "$completed" ]] || return 1
+  printf '%s' "${completed:-base}"
+}
+
 notify_parent() {
-  local status=$1 backend session pane manager_cli name message buffer
+  local status=$1 backend session pane manager_cli name message buffer generation
   case "$status" in done|blocked|failed) ;; *) return 0 ;; esac
+  generation=$(terminal_generation) || return 0
   mkdir -p "$notification_claims"
-  mkdir "$notification_claims/$status" 2>/dev/null || return 0
+  mkdir "$notification_claims/$status-$generation" 2>/dev/null || return 0
 
   backend=$(read_state_file "$agent_dir/parent-backend")
   session=$(read_state_file "$agent_dir/parent-session")
@@ -33,8 +42,8 @@ notify_parent() {
     return 0
   fi
 
-  printf -v message "[pi-subagents] Direct child '%s' reached status '%s'. Collect its handoff with: %q result %q" \
-    "$name" "$status" "$manager_cli" "$name"
+  printf -v message "[pi-subagents] Direct child '%s' reached status '%s' (generation %s). Its durable handoff is available until close: %q result %q" \
+    "$name" "$status" "$generation" "$manager_cli" "$name"
   case "$backend" in
     tmux)
       buffer="pi-subagent-notify-$RANDOM-$$"
@@ -45,7 +54,7 @@ notify_parent() {
       ;;
     zellij)
       if zellij --session "$session" action paste --pane-id "$pane" -- "$message" &&
-        zellij --session "$session" action send-keys --pane-id "$pane" Enter; then
+        sleep 0.2 && zellij --session "$session" action send-keys --pane-id "$pane" Enter; then
         write_atomic "$notification_file" "$status"; rm -f "$notification_error_file"
       else write_atomic "$notification_error_file" "failed to notify Zellij pane $pane in $session"; fi
       ;;
@@ -70,6 +79,8 @@ esac
 
 watch_status &
 watcher_pid=$!
+# Invoked indirectly by the trap below.
+# shellcheck disable=SC2329
 stop_watcher() { kill "$watcher_pid" 2>/dev/null || true; wait "$watcher_pid" 2>/dev/null || true; }
 trap stop_watcher EXIT INT TERM
 

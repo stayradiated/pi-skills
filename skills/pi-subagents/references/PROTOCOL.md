@@ -2,7 +2,7 @@
 
 State defaults to `<project-root>/.pi/subagents/`, with `PI_SUBAGENT_STATE_DIR` as an override. Root managers are scoped by `PI_SESSION_ID`; nested managers use their own agent record. Names are unique only among a manager's direct children.
 
-Each child stores its status, prompt, result, working directory, model, thinking level, hierarchy, backend, multiplexer session, target IDs, parent endpoint, and Pi session data. Status is one of `starting`, `running`, `blocked`, `done`, `failed`, or `stopped`; a missing live target is reported dynamically as `exited`.
+Each child stores its status, prompt, result, working directory, model, thinking level, hierarchy, backend, multiplexer session, target IDs, parent endpoint, and Pi session data. Persisted status is one of `starting`, `running`, `blocked`, `done`, `failed`, or `stopped`. A missing live target is reported dynamically as `exited`; an uncompleted managed steering generation is reported as `steering` so an older terminal status cannot satisfy `wait`.
 
 Commands operate only on the invoking manager's direct children. Nested delegation uses the same interface, and hierarchy metadata is informational. A child must close its own direct children before completion; `close` refuses while child records remain.
 
@@ -15,7 +15,9 @@ Both backends implement the same operations:
 - close its window or tab
 - inject one terminal-status notification into its direct parent's pane
 
-Notifications are attempted once per terminal status. Terminal injection can collide with a draft or dialog, so state and result files remain authoritative.
+Notifications are attempted once per terminal status and managed steering generation. Terminal injection can collide with a draft or dialog, and queued delivery may appear after a manager has already collected or closed the child, so state and result files remain authoritative.
+
+`send` records a steering generation before injecting a wrapped message. It uses Pi's follow-up key while the child is active, retries submission without repasting, and confirms either Pi's visible follow-up queue or a durable user message. The helper records `steering-ack` once the message reaches the Pi session; the child is instructed to update its handoff and complete the generation immediately before its next terminal status. Until completion, status is dynamically `steering`, terminal notifications are suppressed, and waits remain pending. This prevents a pre-steering `done` value from being mistaken for completion of the revised assignment. The `queued` response confirms submission, not that the agent has completed the request.
 
 Children use normal Pi skill, extension, and project-trust handling. They retain the invoking user's filesystem and network permissions; multiplexer tabs are not a sandbox.
 
@@ -46,4 +48,4 @@ zellij attach --create-background pi-work
   --model PROVIDER/MODEL --thinking LEVEL -- "TASK"
 ```
 
-Without `--backend`, the helper infers a named session only when exactly one installed backend owns an active session with that name. The caller owns session creation, attachment, and deletion; the helper manages only child tabs or windows.
+Without `--backend`, the helper infers a named session only when exactly one installed backend owns an active session with that name. The caller owns session creation, attachment, and deletion; the helper manages only child tabs or windows. `close` deletes the child record, including its result and Pi session trace, after refusing active or hierarchy-owning children; collect required evidence first.
