@@ -1,0 +1,416 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+RUNNER="$SCRIPT_DIR/run-agent.sh"
+
+err() { printf 'error: %s\n' "$*" >&2; }
+die() { err "$*"; exit 1; }
+has() { command -v "$1" >/dev/null 2>&1; }
+read_file() { [[ -f "$1" ]] && cat "$1" || true; }
+write_atomic() { local path=$1 value=$2; printf '%s\n' "$value" >"$path.tmp"; mv "$path.tmp" "$path"; }
+
+usage() {
+  cat <<'EOF'
+Usage: pi-subagents COMMAND [ARGS]
+
+Core commands:
+  start NAME [options] -- TASK
+  check [NAME [CONTEXT_WINDOW]]
+  send NAME MESSAGE...
+  wait NAME [TIMEOUT_SECONDS]
+  close NAME
+
+Advanced commands:
+  doctor
+  status [NAME]
+  capture NAME [LINES]
+  result NAME
+  info NAME [--field FIELD]
+  context NAME [CONTEXT_WINDOW]
+  wait-all [TIMEOUT_SECONDS]
+  stop NAME
+  stop-all
+  clean NAME
+
+Start options:
+  --cwd DIR               Existing working directory (default: project root)
+  --model REF             Pi model for the child (required)
+  --thinking LEVEL        off, minimal, low, medium, high, xhigh, or max (required)
+  --backend NAME          tmux or zellij (overrides automatic selection)
+  --session NAME          Existing multiplexer session to target
+
+Outside tmux or Zellij, --session is required. The helper never creates,
+attaches to, or deletes multiplexer sessions.
+EOF
+}
+
+project_root() { git rev-parse --show-toplevel 2>/dev/null || pwd -P; }
+ROOT=$(project_root)
+ROOT=$(cd "$ROOT" && pwd -P)
+STATE_DIR=${PI_SUBAGENT_STATE_DIR:-"$ROOT/.pi/subagents"}
+[[ "$STATE_DIR" == /* ]] || STATE_DIR="$ROOT/$STATE_DIR"
+
+safe_component() {
+  local raw=$1 safe
+  safe=$(printf '%s' "$raw" | tr '[:upper:]' '[:lower:]' | sed -E 's/[^a-z0-9_-]+/-/g; s/^[-_]+//; s/[-_]+$//')
+  [[ -n "$safe" ]] || die "name becomes empty after sanitisation"
+  [[ ${#safe} -le 80 ]] || die "name is too long after sanitisation (max 80 characters)"
+  printf '%s' "$safe"
+}
+
+if [[ -n "${PI_SUBAGENT_SELF_DIR:-}" ]]; then
+  SELF_DIR=$PI_SUBAGENT_SELF_DIR
+  [[ "$SELF_DIR" == /* ]] || die "PI_SUBAGENT_SELF_DIR must be absolute"
+  AGENTS_DIR="$SELF_DIR/children"
+  MANAGER_ID=$(basename "$SELF_DIR")
+  MANAGER_PATH=${PI_SUBAGENT_PATH:-$MANAGER_ID}
+else
+  manager_raw=${PI_SESSION_ID:-${ZELLIJ_PANE_ID:-${TMUX_PANE:-manager-$PPID}}}
+  MANAGER_ID=$(safe_component "$manager_raw")
+  AGENTS_DIR="$STATE_DIR/managers/$MANAGER_ID/children"
+  MANAGER_PATH=${PI_SUBAGENT_PATH:-manager}
+fi
+
+ensure_dirs() { mkdir -p "$AGENTS_DIR"; }
+agent_dir() { printf '%s/%s' "$AGENTS_DIR" "$(safe_component "$1")"; }
+assert_agent_dir() {
+  local dir=$1
+  [[ "$(dirname "$dir")" == "$AGENTS_DIR" && "$(basename "$dir")" != . && "$(basename "$dir")" != .. ]] ||
+    die "refusing unsafe agent path: $dir"
+}
+require_agent() {
+  local dir
+  dir=$(agent_dir "$1")
+  assert_agent_dir "$dir"
+  [[ -d "$dir" ]] || die "unknown direct child: $(safe_component "$1")"
+  printf '%s' "$dir"
+}
+
+current_backend() {
+  local z=0 t=0 pid comm
+  [[ -n "${ZELLIJ_SESSION_NAME:-}" && -n "${ZELLIJ_PANE_ID:-}" ]] && z=1
+  [[ -n "${TMUX:-}" && -n "${TMUX_PANE:-}" ]] && t=1
+  if (( z && !t )); then printf zellij; return; fi
+  if (( t && !z )); then printf tmux; return; fi
+  if (( z && t )); then
+    pid=$PPID
+    while [[ "$pid" =~ ^[0-9]+$ ]] && (( pid > 1 )); do
+      comm=$(ps -o comm= -p "$pid" 2>/dev/null || true)
+      case "$comm" in *zellij*) printf zellij; return ;; *tmux*) printf tmux; return ;; esac
+      pid=$(ps -o ppid= -p "$pid" 2>/dev/null | tr -d ' ' || true)
+    done
+    printf zellij
+  fi
+}
+
+session_alive() {
+  local backend=$1 session=$2
+  case "$backend" in
+    tmux) tmux has-session -t "=$session" 2>/dev/null ;;
+    zellij) zellij list-sessions --no-formatting 2>/dev/null |
+      awk -v wanted="$session" '$1 == wanted && $0 !~ /EXITED/ { found=1 } END { exit !found }' ;;
+  esac
+}
+
+detect_named_backend() {
+  local session=$1 t=0 z=0
+  has tmux && session_alive tmux "$session" && t=1
+  has zellij && session_alive zellij "$session" && z=1
+  if (( t && z )); then die "session '$session' exists in both tmux and Zellij; pass --backend"; fi
+  if (( t )); then printf tmux; return; fi
+  if (( z )); then printf zellij; return; fi
+  die "no active tmux or Zellij session named '$session'"
+}
+
+resolve_backend_session() {
+  local requested_backend=$1 requested_session=$2 active backend session
+  active=$(current_backend)
+  backend=${requested_backend:-${PI_SUBAGENT_BACKEND:-}}
+  [[ -z "$backend" || "$backend" == tmux || "$backend" == zellij ]] || die "backend must be tmux or zellij"
+
+  if [[ -z "$backend" ]]; then
+    if [[ -n "$active" ]]; then backend=$active
+    elif [[ -n "$requested_session" ]]; then backend=$(detect_named_backend "$requested_session")
+    else die "outside tmux/Zellij: start an existing session and pass --session NAME"
+    fi
+  fi
+
+  session=$requested_session
+  if [[ -z "$session" && "$backend" == "$active" ]]; then
+    case "$backend" in
+      tmux) session=$(tmux display-message -p '#S') ;;
+      zellij) session=$ZELLIJ_SESSION_NAME ;;
+    esac
+  fi
+  [[ -n "$session" ]] || die "--session is required because the selected backend is not the current multiplexer"
+  has "$backend" || die "$backend is not installed"
+  session_alive "$backend" "$session" || die "$backend session is not active: $session"
+  printf '%s\n%s\n' "$backend" "$session"
+}
+
+parent_endpoint() {
+  local active
+  active=$(current_backend)
+  case "$active" in
+    tmux) printf 'tmux\n%s\n%s\n' "$(tmux display-message -p '#S')" "$TMUX_PANE" ;;
+    zellij) printf 'zellij\n%s\n%s\n' "$ZELLIJ_SESSION_NAME" "$ZELLIJ_PANE_ID" ;;
+    *) printf '\n\n\n' ;;
+  esac
+}
+
+target_alive() {
+  local dir=$1 backend session target
+  backend=$(read_file "$dir/backend"); session=$(read_file "$dir/multiplexer-session"); target=$(read_file "$dir/target")
+  case "$backend" in
+    tmux)
+      local actual
+      [[ -n "$target" ]] || return 1
+      actual=$(tmux display-message -p -t "$target" '#{pane_id}' 2>/dev/null) || return 1
+      [[ "$actual" == "$target" ]]
+      ;;
+    zellij) [[ -n "$target" ]] && zellij --session "$session" action list-tabs 2>/dev/null |
+      awk -v id="$target" 'NR > 1 && $1 == id { found=1 } END { exit !found }' ;;
+    *) return 1 ;;
+  esac
+}
+
+status_value() {
+  local dir=$1 status
+  status=$(read_file "$dir/status")
+  case "$status" in starting|running|blocked|done|failed|stopped) ;; *) status=unknown ;; esac
+  if [[ "$status" == starting || "$status" == running ]]; then
+    [[ -z "$(read_file "$dir/target")" ]] || target_alive "$dir" || status=exited
+  fi
+  printf '%s' "$status"
+}
+
+build_prompt() {
+  local name=$1 dir=$2 cwd=$3 task=$4 path=$5 status_file result_file q_status q_result
+  status_file="$dir/status"; result_file="$dir/result.md"
+  printf -v q_status '%q' "$status_file"; printf -v q_result '%q' "$result_file"
+  cat >"$dir/prompt.md" <<EOF
+# Subagent: $name
+
+## Task
+
+$task
+
+## Context
+
+- Hierarchy: $path
+- Subagent helper: $SCRIPT_DIR/pi-subagents
+- Working directory: $cwd
+- Status: $status_file
+- Result: $result_file
+
+Stay within the assigned outcome and write scope. Do not merge, rebase, or push. You are a direct child of the invoking manager. You may use the pi-subagents skill normally; any agents you start are your direct children, and you alone manage them. Close all of your direct children before reporting completion.
+
+Set status atomically to \`running\` before work. Write a concise result covering outcome, evidence, changes, validation, risks, and handoff; then set status to \`done\`. If blocked or failed, write the reason and set status to \`blocked\` or \`failed\`. Remain available for steering.
+
+Status update:
+
+    printf '%s\\n' STATUS > $q_status.tmp && mv $q_status.tmp $q_status
+
+Write the result to $q_result. Begin now.
+EOF
+}
+
+shell_join() {
+  local out='' q arg
+  for arg in "$@"; do printf -v q '%q' "$arg"; out+="$q "; done
+  printf '%s' "$out"
+}
+
+launch_target() {
+  local backend=$1 session=$2 name=$3 cwd=$4 shell_cmd=$5 dir=$6 output target container original
+  case "$backend" in
+    tmux)
+      output=$(tmux new-window -d -P -F '#{pane_id}|#{window_id}' -t "=$session:" -n "agent-$name" -c "$cwd" "bash -c $(printf '%q' "$shell_cmd")")
+      IFS='|' read -r target container <<<"$output"
+      ;;
+    zellij)
+      original=''
+      [[ "${ZELLIJ_SESSION_NAME:-}" != "$session" ]] || original=$(zellij action current-tab-info | awk '$1 == "id:" { print $2; exit }')
+      target=$(zellij --session "$session" action new-tab --cwd "$cwd" --name "agent-$name" -- bash -c "$shell_cmd")
+      [[ "$target" =~ ^[0-9]+$ ]] || die "Zellij did not return a tab ID: $target"
+      container=$target
+      [[ ! "$original" =~ ^[0-9]+$ ]] || zellij action go-to-tab-by-id "$original" >/dev/null
+      ;;
+  esac
+  printf '%s\n' "$target" >"$dir/target"
+  printf '%s\n' "$container" >"$dir/container"
+}
+
+cmd_start() {
+  [[ $# -ge 1 ]] || die "start requires NAME"
+  local original_name=$1 name dir cwd="$ROOT" model='' thinking='' backend_arg='' session_arg='' task=''
+  local backend session path shell_cmd target='' parent_backend parent_session parent_target pi_bin
+  shift
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --cwd) [[ $# -ge 2 ]] || die "--cwd requires DIR"; cwd=$2; shift 2 ;;
+      --model) [[ $# -ge 2 && -n "$2" ]] || die "--model requires REF"; model=$2; shift 2 ;;
+      --thinking) [[ $# -ge 2 && -n "$2" ]] || die "--thinking requires LEVEL"; thinking=$2; shift 2 ;;
+      --backend) [[ $# -ge 2 ]] || die "--backend requires NAME"; backend_arg=$2; shift 2 ;;
+      --session) [[ $# -ge 2 && -n "$2" ]] || die "--session requires NAME"; session_arg=$2; shift 2 ;;
+      --) shift; task="$*"; break ;;
+      *) die "unknown start option: $1" ;;
+    esac
+  done
+  [[ -n "${task//[[:space:]]/}" ]] || die "task is empty"
+  [[ -n "$model" ]] || die "--model is required"
+  case "$thinking" in off|minimal|low|medium|high|xhigh|max) ;; *) die "--thinking must be off, minimal, low, medium, high, xhigh, or max" ;; esac
+  [[ -d "$cwd" ]] || die "working directory not found: $cwd"
+  cwd=$(cd "$cwd" && pwd -P)
+  pi_bin=$(command -v pi) || die "pi not found"
+  local resolution
+  resolution=$(resolve_backend_session "$backend_arg" "$session_arg") || return
+  mapfile -t resolved <<<"$resolution"
+  [[ ${#resolved[@]} -eq 2 ]] || die "backend resolution returned malformed output"
+  backend=${resolved[0]}; session=${resolved[1]}
+  mapfile -t parent < <(parent_endpoint)
+  parent_backend=${parent[0]:-}; parent_session=${parent[1]:-}; parent_target=${parent[2]:-}
+
+  name=$(safe_component "$original_name"); ensure_dirs; dir=$(agent_dir "$name"); assert_agent_dir "$dir"
+  mkdir "$dir" 2>/dev/null || die "direct child '$name' already exists; close it or choose another name"
+  start_rollback() {
+    local rc=$?; trap - ERR
+    if [[ -s "$dir/target" ]] && target_alive "$dir"; then close_target "$dir" >/dev/null 2>&1 || true; fi
+    rm -rf "$dir"; return "$rc"
+  }
+  trap start_rollback ERR
+  mkdir -p "$dir/session"
+  write_atomic "$dir/status" starting
+  path="$MANAGER_PATH > $name"
+  printf '%s\n' "$cwd" >"$dir/cwd"; printf '%s\n' "$model" >"$dir/model"; printf '%s\n' "$thinking" >"$dir/thinking"
+  printf '%s\n' "$backend" >"$dir/backend"; printf '%s\n' "$session" >"$dir/multiplexer-session"
+  printf '%s\n' "$MANAGER_ID" >"$dir/parent"; printf '%s\n' "$path" >"$dir/hierarchy"
+  printf '%s\n' "$parent_backend" >"$dir/parent-backend"; printf '%s\n' "$parent_session" >"$dir/parent-session"; printf '%s\n' "$parent_target" >"$dir/parent-target"
+  printf '%s\n' "$SCRIPT_DIR/pi-subagents" >"$dir/manager-cli"
+  build_prompt "$name" "$dir" "$cwd" "$task" "$path"
+
+  local -a pi_args env_args
+  pi_args=("$pi_bin" --name "subagent:$name" --session-dir "$dir/session" --model "$model" --thinking "$thinking")
+  pi_args+=("@$dir/prompt.md" "Execute the managed assignment in the attached brief.")
+  env_args=(env "PI_SUBAGENT_STATE_DIR=$STATE_DIR" "PI_SUBAGENT_SELF_DIR=$dir" "PI_SUBAGENT_PATH=$path")
+  shell_cmd=$(shell_join "$RUNNER" "$dir" "${env_args[@]}" "${pi_args[@]}")
+  launch_target "$backend" "$session" "$name" "$cwd" "$shell_cmd" "$dir"
+  target=$(read_file "$dir/target")
+  trap - ERR
+  printf 'started %-20s %s:%s target %s\n' "$name" "$backend" "$session" "$target"
+  printf 'cwd     %s\n' "$cwd"
+}
+
+get_child_pane() {
+  local dir=$1 pane attempts=${2:-30}
+  for ((; attempts > 0; attempts--)); do pane=$(read_file "$dir/pane"); [[ -n "$pane" ]] && { printf '%s' "$pane"; return; }; sleep 0.1; done
+  die "missing pane ID for $(basename "$dir")"
+}
+
+cmd_send() {
+  [[ $# -ge 2 ]] || die "send requires NAME and MESSAGE"
+  local dir backend session pane message buffer; dir=$(require_agent "$1"); shift; message="$*"
+  target_alive "$dir" || die "child target is not alive"
+  backend=$(read_file "$dir/backend"); session=$(read_file "$dir/multiplexer-session"); pane=$(get_child_pane "$dir")
+  case "$backend" in
+    tmux) buffer="pi-subagent-$RANDOM-$$"; printf '%s' "$message" | tmux load-buffer -b "$buffer" -; tmux paste-buffer -b "$buffer" -d -t "$pane"; tmux send-keys -t "$pane" Enter ;;
+    zellij) zellij --session "$session" action paste --pane-id "$pane" -- "$message"; zellij --session "$session" action send-keys --pane-id "$pane" Enter ;;
+  esac
+  printf 'sent to %s\n' "$(basename "$dir")"
+}
+
+print_status_one() {
+  local dir=$1
+  printf '%-22s %-9s %-8s %-20s %s\n' "$(basename "$dir")" "$(status_value "$dir")" "$(read_file "$dir/backend")" "$(read_file "$dir/multiplexer-session")" "$(read_file "$dir/cwd")"
+}
+cmd_status() {
+  printf '%-22s %-9s %-8s %-20s %s\n' NAME STATUS BACKEND SESSION CWD
+  if [[ $# -gt 0 ]]; then print_status_one "$(require_agent "$1")"; return; fi
+  ensure_dirs; local found=0 dir; shopt -s nullglob
+  for dir in "$AGENTS_DIR"/*; do found=1; print_status_one "$dir"; done
+  shopt -u nullglob; (( found )) || printf '(no direct children)\n'
+}
+
+cmd_capture() {
+  [[ $# -ge 1 ]] || die "capture requires NAME"
+  local dir backend session pane lines=${2:-80}; [[ "$lines" =~ ^[0-9]+$ ]] || die "LINES must be non-negative"
+  dir=$(require_agent "$1"); target_alive "$dir" || die "child target is not alive"
+  backend=$(read_file "$dir/backend"); session=$(read_file "$dir/multiplexer-session"); pane=$(get_child_pane "$dir")
+  case "$backend" in tmux) tmux capture-pane -p -J -S "-$lines" -t "$pane" ;; zellij) zellij --session "$session" action dump-screen --full --pane-id "$pane" | tail -n "$lines" ;; esac
+}
+cmd_result() {
+  local dir; [[ $# -ge 1 ]] || die "result requires NAME"; dir=$(require_agent "$1")
+  printf 'status: %s\n\n' "$(status_value "$dir")"; [[ -s "$dir/result.md" ]] && cat "$dir/result.md" || printf '(no result yet)\n'
+}
+cmd_context() {
+  [[ $# -ge 1 && $# -le 2 ]] || die "usage: context NAME [CONTEXT_WINDOW]"
+  local dir session usage input cache total window=${2:-} percent
+  dir=$(require_agent "$1"); session=$(find "$dir/session" -type f -name '*.jsonl' -print -quit 2>/dev/null || true)
+  [[ -n "$session" ]] || die "no child session data yet"
+  usage=$(grep '"usage":{' "$session" | tail -n 1 || true); [[ -n "$usage" ]] || die "no completed model request yet"
+  input=$(printf '%s\n' "$usage" | sed -n 's/.*"input":\([0-9][0-9]*\).*/\1/p'); cache=$(printf '%s\n' "$usage" | sed -n 's/.*"cacheRead":\([0-9][0-9]*\).*/\1/p')
+  [[ -n "$input" && -n "$cache" ]] || die "could not read token usage"
+  total=$((input + cache)); printf 'estimated context: %s tokens (input %s + cache read %s)\n' "$total" "$input" "$cache"
+  if [[ -n "$window" ]]; then [[ "$window" =~ ^[1-9][0-9]*$ ]] || die "CONTEXT_WINDOW must be positive"; percent=$((total * 100 / window)); printf 'context window:    %s tokens (%s%% used)\n' "$window" "$percent"; (( percent < 40 )) || printf 'recommendation: start a fresh child rather than reusing this one.\n'; fi
+}
+cmd_check() {
+  [[ $# -le 2 ]] || die "usage: check [NAME [CONTEXT_WINDOW]]"
+  if [[ $# -eq 0 ]]; then cmd_status; return; fi
+  local dir session; dir=$(require_agent "$1"); cmd_status "$1"; printf '\n'
+  session=$(find "$dir/session" -type f -name '*.jsonl' -print -quit 2>/dev/null || true)
+  if [[ -n "$session" ]] && grep -q '"usage":{' "$session"; then cmd_context "$@"; printf '\n'; fi
+  if [[ -s "$dir/result.md" ]]; then printf '%s\n\n' '--- result ---'; cat "$dir/result.md"; fi
+}
+cmd_info() {
+  [[ $# -ge 1 ]] || die "info requires NAME"; local dir field=''; dir=$(require_agent "$1"); shift
+  if [[ $# -gt 0 ]]; then [[ "$1" == --field && $# -eq 2 ]] || die "usage: info NAME [--field FIELD]"; field=$2; fi
+  if [[ -n "$field" ]]; then case "$field" in status) status_value "$dir"; printf '\n' ;; state-dir) printf '%s\n' "$dir" ;; name) basename "$dir" ;; cwd|model|thinking|backend|multiplexer-session|target|pane|parent|hierarchy) read_file "$dir/$field"; printf '\n' ;; *) die "unknown field: $field" ;; esac; return; fi
+  for field in name status cwd model thinking backend multiplexer-session target pane parent hierarchy state-dir; do printf '%-20s ' "$field:"; cmd_info "$(basename "$dir")" --field "$field"; done
+}
+
+wait_one() {
+  local name=$1 timeout=$2 started now status; started=$(date +%s)
+  while :; do status=$(status_value "$(require_agent "$name")"); case "$status" in done) printf '%s done\n' "$name"; return 0 ;; blocked) printf '%s blocked\n' "$name"; return 2 ;; failed|exited|stopped) printf '%s %s\n' "$name" "$status"; return 1 ;; esac; now=$(date +%s); if (( timeout > 0 && now - started >= timeout )); then printf '%s timeout\n' "$name"; return 124; fi; sleep 2; done
+}
+cmd_wait() { [[ $# -ge 1 ]] || die "wait requires NAME"; local timeout=${2:-0}; [[ "$timeout" =~ ^[0-9]+$ ]] || die "timeout must be non-negative"; wait_one "$1" "$timeout"; }
+cmd_wait_all() {
+  local timeout=${1:-0} started now pending failed blocked dir status; [[ "$timeout" =~ ^[0-9]+$ ]] || die "timeout must be non-negative"; started=$(date +%s)
+  while :; do pending=0; failed=0; blocked=0; shopt -s nullglob; local dirs=("$AGENTS_DIR"/*); shopt -u nullglob; ((${#dirs[@]})) || { printf '(no direct children)\n'; return 0; }; for dir in "${dirs[@]}"; do status=$(status_value "$dir"); case "$status" in starting|running|unknown) pending=1 ;; blocked) blocked=1 ;; failed|exited|stopped) failed=1 ;; esac; done; if (( !pending )); then cmd_status; (( !failed )) || return 1; (( !blocked )) || return 2; return 0; fi; now=$(date +%s); if (( timeout > 0 && now - started >= timeout )); then cmd_status; return 124; fi; sleep 2; done
+}
+
+close_target() {
+  local dir=$1 backend session target container
+  backend=$(read_file "$dir/backend"); session=$(read_file "$dir/multiplexer-session"); target=$(read_file "$dir/target"); container=$(read_file "$dir/container")
+  case "$backend" in tmux) tmux kill-window -t "$container" ;; zellij) zellij --session "$session" action close-tab-by-id "$target" ;; esac
+}
+cmd_stop() {
+  [[ $# -eq 1 ]] || die "stop requires NAME"; local dir status; dir=$(require_agent "$1")
+  target_alive "$dir" && close_target "$dir" || true; status=$(status_value "$dir"); case "$status" in done|failed|blocked) ;; *) write_atomic "$dir/status" stopped ;; esac; printf 'stopped %s\n' "$(basename "$dir")"
+}
+cmd_stop_all() { ensure_dirs; local dir; shopt -s nullglob; for dir in "$AGENTS_DIR"/*; do cmd_stop "$(basename "$dir")"; done; shopt -u nullglob; }
+has_children() { local dir=$1 child; shopt -s nullglob; local children=("$dir/children"/*); shopt -u nullglob; ((${#children[@]} > 0)); }
+list_children() { local dir=$1 child; shopt -s nullglob; for child in "$dir/children"/*; do [[ -d "$child" ]] && printf '  %s (%s)\n' "$(basename "$child")" "$(status_value "$child")" >&2; done; shopt -u nullglob; }
+cmd_clean() {
+  [[ $# -eq 1 ]] || die "clean requires NAME"; local dir; dir=$(require_agent "$1"); assert_agent_dir "$dir"
+  if has_children "$dir"; then err "child '$(basename "$dir")' still owns direct children:"; list_children "$dir"; die "ask that child to close its children first"; fi
+  target_alive "$dir" && die "child target is still alive; stop it first"
+  rm -rf "$dir"; printf 'cleaned %s\n' "$(basename "$dir")"
+}
+cmd_close() {
+  [[ $# -eq 1 ]] || die "close requires NAME"; local dir status; dir=$(require_agent "$1")
+  if has_children "$dir"; then err "child '$(basename "$dir")' still owns direct children:"; list_children "$dir"; die "ask that child to close its children first"; fi
+  status=$(status_value "$dir"); case "$status" in done|blocked|failed|exited|stopped) ;; *) die "child is $status; close accepts terminal children only (use stop to cancel)" ;; esac
+  cmd_stop "$1"; cmd_clean "$1"
+}
+cmd_doctor() {
+  local failed=0 active; for c in bash pi; do if has "$c"; then printf 'ok   %-8s %s\n' "$c" "$(command -v "$c")"; else printf 'MISS %-8s not found\n' "$c"; failed=1; fi; done
+  for c in zellij tmux; do has "$c" && printf 'ok   %-8s %s\n' "$c" "$(command -v "$c")" || printf 'info %-8s not installed\n' "$c"; done
+  has zellij || has tmux || failed=1; active=$(current_backend); printf 'info current  %s\n' "${active:-none}"; printf 'info state    %s\n' "$STATE_DIR"; printf 'info manager  %s\n' "$MANAGER_ID"; return "$failed"
+}
+
+main() {
+  local cmd=${1:-}; [[ -n "$cmd" ]] || { usage; exit 64; }; shift || true
+  case "$cmd" in doctor) cmd_doctor "$@" ;; start) cmd_start "$@" ;; check) cmd_check "$@" ;; send) cmd_send "$@" ;; status) cmd_status "$@" ;; capture) cmd_capture "$@" ;; result) cmd_result "$@" ;; info) cmd_info "$@" ;; context) cmd_context "$@" ;; wait) cmd_wait "$@" ;; wait-all) cmd_wait_all "$@" ;; stop) cmd_stop "$@" ;; stop-all) cmd_stop_all "$@" ;; close) cmd_close "$@" ;; clean) cmd_clean "$@" ;; -h|--help|help) usage ;; *) usage >&2; die "unknown command: $cmd" ;; esac
+}
+[[ "${BASH_SOURCE[0]}" != "$0" ]] || main "$@"
