@@ -1,6 +1,6 @@
 {
   "name": "@stayradiated/pi-skills",
-  "version": "0.2.2",
+  "version": "0.2.3",
   "description": "A collection of skills for the Pi coding agent",
   "license": "MIT",
   "keywords": [
