@@ -1,6 +1,6 @@
 ---
 name: hone
-description: Hone a plan, decision, or idea through a relentless interview. Use when the user wants to stress-test their thinking or asks to hone an idea.
+description: Explicit invocation only. Load this skill only when the user names the `hone` skill or invokes `/skill:hone`; do not load it based on task similarity.
 ---
 
 Interview the user relentlessly about every aspect of their plan, decision, or idea until you reach a shared understanding. Walk down each branch of the decision tree, resolving dependencies between decisions one by one. For each question, provide your recommended answer.

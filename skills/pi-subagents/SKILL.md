@@ -1,6 +1,6 @@
 ---
 name: pi-subagents
-description: Use when delegating research, implementation, testing, or review to observable Pi subagents in tmux or Zellij.
+description: Explicit invocation only. Load this skill only when the user names the `pi-subagents` skill or invokes `/skill:pi-subagents`; do not load it based on task similarity.
 compatibility: Requires Bash, Pi, and an active tmux or Zellij session.
 ---
 

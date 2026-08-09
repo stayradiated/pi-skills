@@ -1,6 +1,6 @@
 ---
 name: pair-review
-description: Pair-review local code changes through an interactive guided code tour after implementation.
+description: Explicit invocation only. Load this skill only when the user names the `pair-review` skill or invokes `/skill:pair-review`; do not load it based on task similarity.
 ---
 
 # Pair Review
