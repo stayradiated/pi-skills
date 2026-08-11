@@ -32,6 +32,7 @@ Advanced commands:
   stop NAME
   stop-all
   clean NAME
+  limit [NUMBER]
 
 Start options:
   --cwd DIR               Existing working directory (default: project root)
@@ -50,6 +51,19 @@ ROOT=$(project_root)
 ROOT=$(cd "$ROOT" && pwd -P)
 STATE_DIR=${PI_SUBAGENT_STATE_DIR:-"$ROOT/.pi/subagents"}
 [[ "$STATE_DIR" == /* ]] || STATE_DIR="$ROOT/$STATE_DIR"
+
+ensure_concurrency_limit() {
+  local file="$STATE_DIR/concurrency-limit" requested=${PI_SUBAGENT_CONCURRENCY:-8}
+  [[ -s "$file" ]] && return 0
+  [[ "$requested" =~ ^[1-9][0-9]*$ ]] || die "PI_SUBAGENT_CONCURRENCY must be a positive integer"
+  printf '%s\n' "$requested" >"$file.$$.tmp" && mv "$file.$$.tmp" "$file"
+}
+concurrency_limit() {
+  local value
+  value=$(read_file "$STATE_DIR/concurrency-limit")
+  [[ "$value" =~ ^[1-9][0-9]*$ ]] || die "invalid or uninitialized concurrency limit in $STATE_DIR/concurrency-limit"
+  printf '%s' "$value"
+}
 
 safe_component() {
   local raw=$1 safe
@@ -186,8 +200,8 @@ steering_pending() {
 status_value() {
   local dir=$1 status
   status=$(read_file "$dir/status")
-  case "$status" in starting|running|blocked|done|failed|stopped) ;; *) status=unknown ;; esac
-  if [[ "$status" != stopped ]] && steering_pending "$dir"; then
+  case "$status" in queued|starting|running|blocked|done|failed|stopped) ;; *) status=unknown ;; esac
+  if [[ "$status" != queued && "$status" != stopped ]] && steering_pending "$dir"; then
     target_alive "$dir" && status=steering || status=exited
   elif [[ "$status" == starting || "$status" == running ]]; then
     [[ -z "$(read_file "$dir/target")" ]] || target_alive "$dir" || status=exited
@@ -244,6 +258,8 @@ launch_target() {
       target=$(zellij --session "$session" action new-tab --cwd "$cwd" --name "agent-$name" -- bash -c "$shell_cmd")
       [[ "$target" =~ ^[0-9]+$ ]] || die "Zellij did not return a tab ID: $target"
       container=$target
+      printf '%s\n' "$target" >"$dir/target"
+      printf '%s\n' "$container" >"$dir/container"
       [[ ! "$original" =~ ^[0-9]+$ ]] || zellij action go-to-tab-by-id "$original" >/dev/null
       ;;
   esac
@@ -251,10 +267,26 @@ launch_target() {
   printf '%s\n' "$container" >"$dir/container"
 }
 
+launch_agent_record() {
+  local dir=$1 name cwd model thinking backend session path pi_bin shell_cmd target
+  name=$(basename "$dir"); cwd=$(read_file "$dir/cwd"); model=$(read_file "$dir/model")
+  thinking=$(read_file "$dir/thinking"); backend=$(read_file "$dir/backend")
+  session=$(read_file "$dir/multiplexer-session"); path=$(read_file "$dir/hierarchy")
+  [[ "$(read_file "$dir/status")" == queued ]] || die "queued child '$name' was cancelled before launch"
+  [[ -d "$cwd" ]] || die "queued child '$name' working directory no longer exists: $cwd"
+  session_alive "$backend" "$session" || die "queued child '$name' multiplexer session is not active: $session"
+  pi_bin=$(command -v pi) || die "pi not found"
+  write_atomic "$dir/status" starting
+  shell_cmd=$(shell_join "$RUNNER" "$dir" env "PI_SUBAGENT_STATE_DIR=$STATE_DIR" "PI_SUBAGENT_SELF_DIR=$dir" "PI_SUBAGENT_PATH=$path" "$pi_bin" --name "subagent:$name" --session-dir "$dir/session" --model "$model" --thinking "$thinking" "@$dir/prompt.md" "Proceed.")
+  launch_target "$backend" "$session" "$name" "$cwd" "$shell_cmd" "$dir"
+  target=$(read_file "$dir/target")
+  printf 'started %-20s %s:%s target %s\n' "$name" "$backend" "$session" "$target"
+}
+
 cmd_start() {
   [[ $# -ge 1 ]] || die "start requires NAME"
   local original_name=$1 name dir cwd="$ROOT" model='' thinking='' backend_arg='' session_arg='' task=''
-  local backend session path shell_cmd target='' parent_backend parent_session parent_target pi_bin
+  local backend session path parent_backend parent_session parent_target pi_bin resolution
   shift
   while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -271,44 +303,121 @@ cmd_start() {
   [[ -n "$model" ]] || die "--model is required"
   case "$thinking" in off|minimal|low|medium|high|xhigh|max) ;; *) die "--thinking must be off, minimal, low, medium, high, xhigh, or max" ;; esac
   [[ -d "$cwd" ]] || die "working directory not found: $cwd"
-  cwd=$(cd "$cwd" && pwd -P)
-  pi_bin=$(command -v pi) || die "pi not found"
-  local resolution
+  cwd=$(cd "$cwd" && pwd -P); pi_bin=$(command -v pi) || die "pi not found"
   resolution=$(resolve_backend_session "$backend_arg" "$session_arg") || return
-  mapfile -t resolved <<<"$resolution"
-  [[ ${#resolved[@]} -eq 2 ]] || die "backend resolution returned malformed output"
-  backend=${resolved[0]}; session=${resolved[1]}
-  mapfile -t parent < <(parent_endpoint)
+  mapfile -t resolved <<<"$resolution"; [[ ${#resolved[@]} -eq 2 ]] || die "backend resolution returned malformed output"
+  backend=${resolved[0]}; session=${resolved[1]}; mapfile -t parent < <(parent_endpoint)
   parent_backend=${parent[0]:-}; parent_session=${parent[1]:-}; parent_target=${parent[2]:-}
 
-  name=$(safe_component "$original_name"); ensure_dirs; dir=$(agent_dir "$name"); assert_agent_dir "$dir"
-  mkdir "$dir" 2>/dev/null || die "direct child '$name' already exists; close it or choose another name"
-  start_rollback() {
-    local rc=$?; trap - ERR
-    if [[ -s "$dir/target" ]] && target_alive "$dir"; then close_target "$dir" >/dev/null 2>&1 || true; fi
-    rm -rf "$dir"; return "$rc"
-  }
-  trap start_rollback ERR
-  mkdir -p "$dir/session"
-  write_atomic "$dir/status" starting
-  path="$MANAGER_PATH > $name"
+  name=$(safe_component "$original_name"); ensure_dirs
+  dispatch_lock_acquire; ensure_concurrency_limit; dispatch_lock_release
+  dir=$(agent_dir "$name"); assert_agent_dir "$dir"; mkdir "$dir" 2>/dev/null || die "direct child '$name' already exists; close it or choose another name"
+  enqueue_rollback() { local rc=$?; trap - ERR; rm -rf "$dir"; return "$rc"; }
+  trap enqueue_rollback ERR
+  mkdir -p "$dir/session"; path="$MANAGER_PATH > $name"
   printf '%s\n' "$cwd" >"$dir/cwd"; printf '%s\n' "$model" >"$dir/model"; printf '%s\n' "$thinking" >"$dir/thinking"
   printf '%s\n' "$backend" >"$dir/backend"; printf '%s\n' "$session" >"$dir/multiplexer-session"
   printf '%s\n' "$MANAGER_ID" >"$dir/parent"; printf '%s\n' "$path" >"$dir/hierarchy"
   printf '%s\n' "$parent_backend" >"$dir/parent-backend"; printf '%s\n' "$parent_session" >"$dir/parent-session"; printf '%s\n' "$parent_target" >"$dir/parent-target"
-  printf '%s\n' "$SCRIPT_DIR/pi-subagents" >"$dir/manager-cli"
-  build_prompt "$name" "$dir" "$cwd" "$task" "$path"
-
-  local -a pi_args env_args
-  pi_args=("$pi_bin" --name "subagent:$name" --session-dir "$dir/session" --model "$model" --thinking "$thinking")
-  pi_args+=("@$dir/prompt.md" "Proceed.")
-  env_args=(env "PI_SUBAGENT_STATE_DIR=$STATE_DIR" "PI_SUBAGENT_SELF_DIR=$dir" "PI_SUBAGENT_PATH=$path")
-  shell_cmd=$(shell_join "$RUNNER" "$dir" "${env_args[@]}" "${pi_args[@]}")
-  launch_target "$backend" "$session" "$name" "$cwd" "$shell_cmd" "$dir"
-  target=$(read_file "$dir/target")
+  printf '%s\n' "$SCRIPT_DIR/pi-subagents" >"$dir/manager-cli"; printf '%s\n' "$(date +%s%N)-$$-$RANDOM" >"$dir/queue-ticket"
+  build_prompt "$name" "$dir" "$cwd" "$task" "$path"; write_atomic "$dir/status" queued
   trap - ERR
-  printf 'started %-20s %s:%s target %s\n' "$name" "$backend" "$session" "$target"
-  printf 'cwd     %s\n' "$cwd"
+  kick_dispatch
+  printf 'queued %-21s ticket %s\n' "$name" "$(read_file "$dir/queue-ticket")"
+}
+
+record_dirs() {
+  [[ -d "$STATE_DIR/managers" ]] || return 0
+  find "$STATE_DIR/managers" -type f -name status -printf '%h\n' 2>/dev/null
+}
+record_is_active() {
+  local dir=$1 status
+  status=$(read_file "$dir/status")
+  case "$status" in starting|running) return 0 ;; *) return 1 ;; esac
+}
+record_has_active_descendant() {
+  local dir=$1 child
+  while IFS= read -r child; do record_is_active "$(dirname "$child")" && return 0; done < <(find "$dir/children" -type f -name status -print 2>/dev/null)
+  return 1
+}
+parent_record_dir() {
+  local dir=$1 parent
+  [[ "$(basename "$(dirname "$dir")")" == children ]] || return 1
+  parent=$(dirname "$(dirname "$dir")")
+  [[ -f "$parent/status" ]] && printf '%s' "$parent"
+}
+active_leaf_count() {
+  local dir count=0
+  while IFS= read -r dir; do
+    if record_is_active "$dir" && ! record_has_active_descendant "$dir"; then count=$((count + 1)); fi
+  done < <(record_dirs)
+  printf '%s' "$count"
+}
+queued_records() {
+  local dir ticket
+  while IFS= read -r dir; do
+    [[ "$(read_file "$dir/status")" == queued ]] || continue
+    ticket=$(read_file "$dir/queue-ticket"); [[ -n "$ticket" ]] || ticket="0-$(basename "$dir")"
+    printf '%s\t%s\n' "$ticket" "$dir"
+  done < <(record_dirs) | sort -n -k1,1
+}
+mark_launch_failed() {
+  local dir=$1 message=$2
+  target_alive "$dir" && close_target "$dir" >/dev/null 2>&1 || true
+  cat >"$dir/result.md" <<EOF
+# Result
+
+Queued launch failed: $message
+EOF
+  write_atomic "$dir/status" failed
+}
+dispatch_lock_acquire() {
+  mkdir -p "$STATE_DIR"
+  has flock || die "flock is required for concurrency dispatch"
+  exec {DISPATCH_LOCK_FD}>"$STATE_DIR/dispatch.lock"
+  flock "$DISPATCH_LOCK_FD"
+}
+dispatch_lock_release() {
+  flock -u "$DISPATCH_LOCK_FD"
+  exec {DISPATCH_LOCK_FD}>&-
+  unset DISPATCH_LOCK_FD
+}
+reconcile_dead_records() {
+  local dir status
+  while IFS= read -r dir; do
+    status=$(read_file "$dir/status")
+    case "$status" in
+      starting|running)
+        target_alive "$dir" || mark_launch_failed "$dir" "child target is no longer alive"
+        ;;
+    esac
+  done < <(record_dirs)
+}
+cmd_dispatch() (
+  local limit dir parent cost leaves output before after
+  dispatch_lock_acquire
+  trap dispatch_lock_release EXIT
+  while :; do
+    before=$(read_file "$STATE_DIR/dispatch-wake")
+    ensure_concurrency_limit; reconcile_dead_records; limit=$(concurrency_limit)
+    while IFS=$'\t' read -r _ dir; do
+      [[ -d "$dir" && "$(read_file "$dir/status")" == queued ]] || continue
+      parent=$(parent_record_dir "$dir" || true)
+      if [[ -n "$parent" ]] && ! record_is_active "$parent"; then mark_launch_failed "$dir" "parent is no longer active"; continue; fi
+      cost=1
+      if [[ -n "$parent" ]] && record_is_active "$parent" && ! record_has_active_descendant "$parent"; then cost=0; fi
+      leaves=$(active_leaf_count); (( leaves + cost <= limit )) || continue
+      if output=$(launch_agent_record "$dir" 2>&1); then printf '%s\n' "$output" >&2; else mark_launch_failed "$dir" "$output"; fi
+    done < <(queued_records)
+    after=$(read_file "$STATE_DIR/dispatch-wake")
+    if [[ "$before" == "$after" ]]; then break; fi
+  done
+)
+kick_dispatch() {
+  mkdir -p "$STATE_DIR"
+  printf '%s\n' "$(date +%s%N)-$$-$RANDOM" >"$STATE_DIR/dispatch-wake.$$.tmp"
+  mv "$STATE_DIR/dispatch-wake.$$.tmp" "$STATE_DIR/dispatch-wake"
+  "$SCRIPT_DIR/pi-subagents" _dispatch >/dev/null 2>&1 &
 }
 
 get_child_pane() {
@@ -363,13 +472,15 @@ cmd_send() (
   mkdir "$lock" 2>/dev/null || die "another send is already in progress for $(basename "$dir")"
   trap 'rmdir "$lock" 2>/dev/null || true' EXIT
 
+  dispatch_lock_acquire
   steering_pending "$dir" && die "child already has uncompleted steering; inspect it before sending again"
   status=$(status_value "$dir")
-  case "$status" in blocked|failed|exited|stopped) die "child is $status; collect its handoff and use a fresh child" ;; esac
+  case "$status" in done|blocked|failed|exited|stopped) die "child is $status; collect its handoff and use a fresh child" ;; esac
 
   generation="$(date +%s)-$$-$RANDOM"
   previous_pending=$(read_file "$dir/steering-pending")
   write_atomic "$dir/steering-pending" "$generation"
+  dispatch_lock_release
   printf -v q_completed '%q' "$dir/steering-completed"
   wrapped=$(cat <<EOF
 [pi-subagents steering $generation]
@@ -466,6 +577,7 @@ cmd_context() {
 }
 cmd_check() {
   [[ $# -le 2 ]] || die "usage: check [NAME [CONTEXT_WINDOW]]"
+  kick_dispatch
   if [[ $# -eq 0 ]]; then cmd_status; return; fi
   local dir session; dir=$(require_agent "$1"); refresh_steering_ack "$dir"; cmd_status "$1"; printf '\n'
   session=$(latest_session_file "$dir" || true)
@@ -485,12 +597,12 @@ cmd_info() {
 
 wait_one() {
   local name=$1 timeout=$2 started now status dir; started=$(date +%s)
-  while :; do dir=$(require_agent "$name"); refresh_steering_ack "$dir"; status=$(status_value "$dir"); case "$status" in done) printf '%s done\n' "$name"; return 0 ;; blocked) printf '%s blocked\n' "$name"; return 2 ;; failed|exited|stopped) printf '%s %s\n' "$name" "$status"; return 1 ;; esac; now=$(date +%s); if (( timeout > 0 && now - started >= timeout )); then printf '%s timeout\n' "$name"; return 124; fi; sleep 2; done
+  while :; do kick_dispatch; dir=$(require_agent "$name"); refresh_steering_ack "$dir"; status=$(status_value "$dir"); case "$status" in done) printf '%s done\n' "$name"; return 0 ;; blocked) printf '%s blocked\n' "$name"; return 2 ;; failed|exited|stopped) printf '%s %s\n' "$name" "$status"; return 1 ;; esac; now=$(date +%s); if (( timeout > 0 && now - started >= timeout )); then printf '%s timeout\n' "$name"; return 124; fi; sleep 2; done
 }
 cmd_wait() { [[ $# -ge 1 ]] || die "wait requires NAME"; local timeout=${2:-0}; [[ "$timeout" =~ ^[0-9]+$ ]] || die "timeout must be non-negative"; wait_one "$1" "$timeout"; }
 cmd_wait_all() {
   local timeout=${1:-0} started now pending failed blocked dir status; [[ "$timeout" =~ ^[0-9]+$ ]] || die "timeout must be non-negative"; started=$(date +%s)
-  while :; do pending=0; failed=0; blocked=0; shopt -s nullglob; local dirs=("$AGENTS_DIR"/*); shopt -u nullglob; ((${#dirs[@]})) || { printf '(no direct children)\n'; return 0; }; for dir in "${dirs[@]}"; do status=$(status_value "$dir"); case "$status" in starting|running|steering|unknown) pending=1 ;; blocked) blocked=1 ;; failed|exited|stopped) failed=1 ;; esac; done; if (( !pending )); then cmd_status; (( !failed )) || return 1; (( !blocked )) || return 2; return 0; fi; now=$(date +%s); if (( timeout > 0 && now - started >= timeout )); then cmd_status; return 124; fi; sleep 2; done
+  while :; do kick_dispatch; pending=0; failed=0; blocked=0; shopt -s nullglob; local dirs=("$AGENTS_DIR"/*); shopt -u nullglob; ((${#dirs[@]})) || { printf '(no direct children)\n'; return 0; }; for dir in "${dirs[@]}"; do status=$(status_value "$dir"); case "$status" in queued|starting|running|steering|unknown) pending=1 ;; blocked) blocked=1 ;; failed|exited|stopped) failed=1 ;; esac; done; if (( !pending )); then cmd_status; (( !failed )) || return 1; (( !blocked )) || return 2; return 0; fi; now=$(date +%s); if (( timeout > 0 && now - started >= timeout )); then cmd_status; return 124; fi; sleep 2; done
 }
 
 close_target() {
@@ -498,36 +610,50 @@ close_target() {
   backend=$(read_file "$dir/backend"); session=$(read_file "$dir/multiplexer-session"); target=$(read_file "$dir/target"); container=$(read_file "$dir/container")
   case "$backend" in tmux) tmux kill-window -t "$container" ;; zellij) zellij --session "$session" action close-tab-by-id "$target" ;; esac
 }
-cmd_stop() {
-  [[ $# -eq 1 ]] || die "stop requires NAME"; local dir status; dir=$(require_agent "$1")
-  target_alive "$dir" && close_target "$dir" || true; status=$(status_value "$dir"); case "$status" in done|failed|blocked) ;; *) write_atomic "$dir/status" stopped ;; esac; printf 'stopped %s\n' "$(basename "$dir")"
-}
+cmd_stop() (
+  [[ $# -eq 1 ]] || die "stop requires NAME"; local dir status; dispatch_lock_acquire; trap dispatch_lock_release EXIT
+  dir=$(require_agent "$1"); target_alive "$dir" && close_target "$dir" || true
+  status=$(status_value "$dir"); case "$status" in done|failed|blocked) ;; *) write_atomic "$dir/status" stopped ;; esac
+  kick_dispatch; printf 'stopped %s\n' "$(basename "$dir")"
+)
 cmd_stop_all() { ensure_dirs; local dir; shopt -s nullglob; for dir in "$AGENTS_DIR"/*; do cmd_stop "$(basename "$dir")"; done; shopt -u nullglob; }
 has_children() { local dir=$1 child; shopt -s nullglob; local children=("$dir/children"/*); shopt -u nullglob; ((${#children[@]} > 0)); }
 list_children() { local dir=$1 child; shopt -s nullglob; for child in "$dir/children"/*; do [[ -d "$child" ]] && printf '  %s (%s)\n' "$(basename "$child")" "$(status_value "$child")" >&2; done; shopt -u nullglob; }
-cmd_clean() {
-  [[ $# -eq 1 ]] || die "clean requires NAME"; local dir; dir=$(require_agent "$1"); assert_agent_dir "$dir"
+cmd_clean() (
+  [[ $# -eq 1 ]] || die "clean requires NAME"; local dir; dispatch_lock_acquire; trap dispatch_lock_release EXIT
+  dir=$(require_agent "$1"); assert_agent_dir "$dir"
   if has_children "$dir"; then err "child '$(basename "$dir")' still owns direct children:"; list_children "$dir"; die "ask that child to close its children first"; fi
   target_alive "$dir" && die "child target is still alive; stop it first"
   rm -rf "$dir"; printf 'cleaned %s\n' "$(basename "$dir")"
-}
-cmd_close() {
-  [[ $# -eq 1 ]] || die "close requires NAME"; local dir status; dir=$(require_agent "$1")
-  [[ ! -d "$dir/send-lock" ]] || die "child has a send in progress"
+)
+cmd_close() (
+  [[ $# -eq 1 ]] || die "close requires NAME"; local dir status; dispatch_lock_acquire; trap dispatch_lock_release EXIT
+  dir=$(require_agent "$1"); [[ ! -d "$dir/send-lock" ]] || die "child has a send in progress"
   if has_children "$dir"; then err "child '$(basename "$dir")' still owns direct children:"; list_children "$dir"; die "ask that child to close its children first"; fi
   status=$(status_value "$dir"); case "$status" in done|blocked|failed|exited|stopped) ;; *) die "child is $status; close accepts terminal children only (use stop to cancel)" ;; esac
   target_alive "$dir" && close_target "$dir" || true
-  printf 'closed %s\n' "$(basename "$dir")"
-  cmd_clean "$1"
-}
+  printf 'closed %s\n' "$(basename "$dir")"; rm -rf "$dir"; printf 'cleaned %s\n' "$1"
+)
+cmd_limit() (
+  [[ $# -le 1 ]] || die "usage: limit [NUMBER]"
+  dispatch_lock_acquire; trap dispatch_lock_release EXIT
+  ensure_concurrency_limit
+  if [[ $# -eq 1 ]]; then
+    [[ "$1" =~ ^[1-9][0-9]*$ ]] || die "limit must be a positive integer"
+    printf '%s\n' "$1" >"$STATE_DIR/concurrency-limit.$$.tmp" && mv "$STATE_DIR/concurrency-limit.$$.tmp" "$STATE_DIR/concurrency-limit"
+    kick_dispatch
+  fi
+  printf '%s\n' "$(concurrency_limit)"
+)
 cmd_doctor() {
-  local failed=0 active; for c in bash pi; do if has "$c"; then printf 'ok   %-8s %s\n' "$c" "$(command -v "$c")"; else printf 'MISS %-8s not found\n' "$c"; failed=1; fi; done
+  local failed=0 active limit; dispatch_lock_acquire; ensure_concurrency_limit; limit=$(concurrency_limit); dispatch_lock_release
+  for c in bash pi flock; do if has "$c"; then printf 'ok   %-8s %s\n' "$c" "$(command -v "$c")"; else printf 'MISS %-8s not found\n' "$c"; failed=1; fi; done
   for c in zellij tmux; do has "$c" && printf 'ok   %-8s %s\n' "$c" "$(command -v "$c")" || printf 'info %-8s not installed\n' "$c"; done
-  has zellij || has tmux || failed=1; active=$(current_backend); printf 'info current  %s\n' "${active:-none}"; printf 'info state    %s\n' "$STATE_DIR"; printf 'info manager  %s\n' "$MANAGER_ID"; return "$failed"
+  has zellij || has tmux || failed=1; active=$(current_backend); printf 'info current  %s\n' "${active:-none}"; printf 'info state    %s\n' "$STATE_DIR"; printf 'info limit    %s active leaves\n' "$limit"; printf 'info manager  %s\n' "$MANAGER_ID"; return "$failed"
 }
 
 main() {
   local cmd=${1:-}; [[ -n "$cmd" ]] || { usage; exit 64; }; shift || true
-  case "$cmd" in doctor) cmd_doctor "$@" ;; start) cmd_start "$@" ;; check) cmd_check "$@" ;; send) cmd_send "$@" ;; status) cmd_status "$@" ;; capture) cmd_capture "$@" ;; result) cmd_result "$@" ;; info) cmd_info "$@" ;; context) cmd_context "$@" ;; wait) cmd_wait "$@" ;; wait-all) cmd_wait_all "$@" ;; stop) cmd_stop "$@" ;; stop-all) cmd_stop_all "$@" ;; close) cmd_close "$@" ;; clean) cmd_clean "$@" ;; -h|--help|help) usage ;; *) usage >&2; die "unknown command: $cmd" ;; esac
+  case "$cmd" in doctor) cmd_doctor "$@" ;; start) cmd_start "$@" ;; check) cmd_check "$@" ;; send) cmd_send "$@" ;; status) cmd_status "$@" ;; capture) cmd_capture "$@" ;; result) cmd_result "$@" ;; info) cmd_info "$@" ;; context) cmd_context "$@" ;; wait) cmd_wait "$@" ;; wait-all) cmd_wait_all "$@" ;; stop) cmd_stop "$@" ;; stop-all) cmd_stop_all "$@" ;; close) cmd_close "$@" ;; clean) cmd_clean "$@" ;; limit) cmd_limit "$@" ;; _dispatch) cmd_dispatch "$@" ;; -h|--help|help) usage ;; *) usage >&2; die "unknown command: $cmd" ;; esac
 }
 [[ "${BASH_SOURCE[0]}" != "$0" ]] || main "$@"

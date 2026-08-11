@@ -30,7 +30,7 @@ Do not default every child to Sol. Use the lowest thinking level likely to succe
 "$AGENTS" check NAME
 ```
 
-Use `--cwd DIR` for another existing directory. Outside a multiplexer, pass `--session NAME` for an existing session. `READY=target` means the target exists but no pane is recorded; `READY=ready` means it is addressable. `STATUS=starting` means launch is pending; `running` means the child command has started.
+Use `--cwd DIR` for another existing directory. Outside a multiplexer, pass `--session NAME` for an existing session. `READY=target` means the target exists but no pane is recorded; `READY=ready` means it is addressable. Starts enter the shared project queue and normally return `queued`; the dispatcher changes this to `starting` when capacity is available, then `running` when the child command has started. The state-directory-wide active-leaf limit defaults to 8, is initialized from `PI_SUBAGENT_CONCURRENCY`, and can be inspected or changed with `"$AGENTS" limit [NUMBER]`.
 
 ## Continue and steer
 
@@ -40,7 +40,7 @@ Use `--cwd DIR` for another existing directory. Outside a multiplexer, pass `--s
 "$AGENTS" capture NAME 80
 ```
 
-`send` records a steering generation before injection. While it is incomplete, `check` reports `steering` and `wait` stays pending. Confirm the acknowledgement and revised handoff. Use a fresh child instead of steering a blocked or failed child. At 40% context or more, collect the handoff and use a fresh child.
+`send` records a steering generation before injection. While it is incomplete, `check` reports `steering` and `wait` stays pending. Confirm the acknowledgement and revised handoff. Steering is accepted only for an active child; use a fresh child once it is done, blocked, or failed so a completed record cannot bypass the global concurrency limit. At 40% context or more, collect the handoff and use a fresh child.
 
 ## Integrate and close
 

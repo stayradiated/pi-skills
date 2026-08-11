@@ -119,6 +119,43 @@ if grep -F 'stopped tmux-child' <<<"$close_output" >/dev/null; then
   printf 'terminal close was reported as stopped\n' >&2
   exit 1
 fi
+
+# The state-root queue enforces its cap, while a first nested child transfers
+# its parent's active-leaf slot.
+run limit 1 >/dev/null
+run start queued-one --backend tmux --session "$TMUX_SESSION" --cwd "$TMP/project" --model test/model --thinking low -- "first queued worker" >/dev/null
+run start queued-two --backend tmux --session "$TMUX_SESSION" --cwd "$TMP/project" --model test/model --thinking low -- "second queued worker" >/dev/null
+QUEUE_ONE="$STATE/managers/test-manager/children/queued-one"
+QUEUE_TWO="$STATE/managers/test-manager/children/queued-two"
+for _ in {1..50}; do [[ "$(run info queued-one --field status)" == running ]] && break; sleep 0.1; done
+[[ "$(run info queued-one --field status)" == running ]]
+[[ "$(run info queued-two --field status)" == queued ]]
+printf '%s\n' 'done' >"$QUEUE_ONE/status"
+# Explicit dispatch is also the recovery path after an interrupted watcher.
+run _dispatch
+for _ in {1..50}; do [[ "$(run info queued-two --field status)" == running ]] && break; sleep 0.1; done
+[[ "$(run info queued-two --field status)" == running ]]
+# A completed record has released its slot and cannot be reactivated by steering.
+expect_status 1 send queued-one "must not bypass the global limit"
+NESTED="$QUEUE_TWO/children/nested"
+mkdir -p "$NESTED/session"
+for field in cwd model thinking backend multiplexer-session manager-cli; do cp "$QUEUE_TWO/$field" "$NESTED/$field"; done
+printf '%s\n' 'test-manager' >"$NESTED/parent"
+printf '%s\n' 'manager > queued-two > nested' >"$NESTED/hierarchy"
+printf '%s\n' '' >"$NESTED/parent-backend"
+printf '%s\n' '' >"$NESTED/parent-session"
+printf '%s\n' '' >"$NESTED/parent-target"
+printf '%s\n' '1' >"$NESTED/queue-ticket"
+printf '%s\n' '# Subagent' >"$NESTED/prompt.md"
+printf '%s\n' queued >"$NESTED/status"
+run _dispatch
+for _ in {1..50}; do [[ "$(cat "$NESTED/status")" == running ]] && break; sleep 0.1; done
+[[ "$(cat "$NESTED/status")" == running ]]
+(cd "$TMP/project" && env PATH="$TMP/bin:$PATH" PI_SUBAGENT_STATE_DIR="$STATE" PI_SUBAGENT_SELF_DIR="$QUEUE_TWO" "$CLI" stop nested) >/dev/null
+(cd "$TMP/project" && env PATH="$TMP/bin:$PATH" PI_SUBAGENT_STATE_DIR="$STATE" PI_SUBAGENT_SELF_DIR="$QUEUE_TWO" "$CLI" close nested) >/dev/null
+run stop queued-two >/dev/null
+run close queued-one >/dev/null
+run close queued-two >/dev/null
 else
   printf 'skip: tmux transport tests (tmux is not installed)\n'
 fi

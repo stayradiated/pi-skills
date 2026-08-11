@@ -62,11 +62,27 @@ notify_parent() {
   esac
 }
 
+kick_dispatch() {
+  local manager_cli
+  manager_cli=$(read_state_file "$agent_dir/manager-cli")
+  [[ -n "$manager_cli" && -x "$manager_cli" ]] || return 0
+  "$manager_cli" _dispatch >/dev/null 2>&1 &
+}
+
 watch_status() {
-  local status
+  local status dispatched='' generation key
   while :; do
     status=$(read_state_file "$status_file")
-    case "$status" in done|blocked|failed) notify_parent "$status" ;; stopped) return ;; esac
+    case "$status" in
+      done|blocked|failed)
+        notify_parent "$status"
+        if generation=$(terminal_generation); then
+          key="$status-$generation"
+          [[ "$dispatched" == "$key" ]] || { kick_dispatch; dispatched=$key; }
+        fi
+        ;;
+      stopped) kick_dispatch; return ;;
+    esac
     sleep 0.2
   done
 }
@@ -106,4 +122,5 @@ EOF
     ;;
 esac
 notify_parent "$status"
+kick_dispatch
 exit "$rc"
