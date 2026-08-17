@@ -1,6 +1,6 @@
 ---
 name: pi-subagents
-description: Explicit invocation only. Load this skill only when the user names the `pi-subagents` skill or invokes `/skill:pi-subagents`; do not load it based on task similarity.
+description: Load this skill whenever the user explicitly mentions a `subagent` or `subagents`, asks to delegate work to a subagent, names the `pi-subagents` skill, or invokes `/skill:pi-subagents`; do not load it based only on task similarity.
 compatibility: Requires Bash, Pi, and an active tmux or Zellij session.
 ---
 
