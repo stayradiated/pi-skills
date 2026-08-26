@@ -54,4 +54,28 @@ Read the handoff, inspect claimed changes, check scope and conflicts, and valida
 
 `close` refuses active children and children that still own agent records, then removes the child's target and state. Collect any result before closing. Finish only when no direct children remain and every handoff is integrated or deliberately rejected.
 
+## Audit and clean stale agents
+
+`pi-subagents check` lists only the current manager's direct children. After recovery, or before saying all agents are cleaned up, also audit the multiplexer and process table: prior manager sessions can leave orphaned `agent-*` tabs and running `pi --name subagent:*` processes that the current helper state does not report.
+
+```bash
+"$AGENTS" check
+zellij action list-panes
+zellij action list-tabs
+ps -eo pid,pgid,ppid,args | rg 'subagent:|pi-subagents'
+```
+
+Do not terminate a live child that is still relevant. For an orphaned, no-longer-needed agent, terminate its **process group** gracefully, wait, force-kill only if necessary, then close its pane by ID and re-audit:
+
+```bash
+kill -TERM -- -PGID
+sleep 3
+pgrep -g PGID >/dev/null && kill -KILL -- -PGID || true
+zellij action close-pane --pane-id terminal_N
+zellij action list-panes
+ps -eo pid,pgid,ppid,args | rg 'subagent:|pi-subagents' || true
+```
+
+Never report cleanup complete from helper state alone when visible `agent-*` tabs remain. Preserve or collect any useful handoff before termination; subagents must not be left running merely because their parent state was lost.
+
 See [references/PROTOCOL.md](references/PROTOCOL.md) for state and transport semantics, or run `"$AGENTS" help` for the full command surface.
