@@ -6,6 +6,7 @@ A small collection of skills for the [Pi coding agent](https://pi.dev).
 
 - **hone** — stress-test a plan, decision, or idea through a focused interview.
 - **pair-review** — walk through local code changes as an interactive, read-only review.
+- **pair-program** — human-driven pair programming: the agent navigates in small steps and reviews your edits without taking over.
 - **pi-subagents** — delegate observable Pi subagents through one interface for tmux and Zellij.
 - **mise-install** — install and verify user-scoped command-line software with mise.
 
