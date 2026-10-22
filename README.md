@@ -4,11 +4,10 @@ A small collection of skills for the [Pi coding agent](https://pi.dev).
 
 ## Skills
 
-- **hone** — stress-test a plan, decision, or idea through a focused interview.
-- **pair-review** — walk through local code changes as an interactive, read-only review.
-- **pair-program** — human-driven pair programming: the agent navigates in small steps and reviews your edits without taking over.
-- **pi-subagents** — delegate observable Pi subagents through one interface for tmux and Zellij.
-- **mise-install** — install and verify user-scoped command-line software with mise.
+- [**hone**](skills/hone/SKILL.md) — stress-test a plan, decision, or idea through a focused interview.
+- [**pair-review**](skills/pair-review/SKILL.md) — walk through local code changes as an interactive, read-only review.
+- [**pair-program**](skills/pair-program/SKILL.md) — human-driven pair programming: the agent navigates in small steps and reviews your edits without taking over.
+- [**pi-subagents**](skills/pi-subagents/SKILL.md) — delegate observable Pi subagents through one interface for tmux and Zellij.
 
 ## Install
 
@@ -37,7 +36,7 @@ npm test
 
 Use `npm pack --dry-run` to inspect the files included in the npm package.
 
-The `pi-subagents` skill requires Bash, Pi, and an active tmux or Zellij session. The `mise-install` skill requires mise.
+The `pi-subagents` skill requires Bash, `flock`, Pi, and tmux or Zellij. It reuses the current multiplexer session; from outside one, create a session and pass `--session NAME`. See its [README](skills/pi-subagents/README.md) for details.
 
 ## License
 
